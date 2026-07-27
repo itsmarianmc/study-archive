@@ -1,15 +1,15 @@
 # Study Archive
 
 <p>
-  <a href="">
+  <a href="https://github.com/itsmarianmc/study-archive">
     <img alt="GitHub" height="56" src="https://cdn.jsdelivr.net/npm/@intergrav/devins-badges@3/assets/compact/available/github_vector.svg">
   </a>
   &nbsp;
-  <a href="">
+  <a href="https://ko-fi.com/itsmarian">
     <img alt="kofi-singular" height="56" src="https://cdn.jsdelivr.net/npm/@intergrav/devins-badges@3/assets/cozy/donate/kofi-singular_vector.svg">
   </a>
   &nbsp;
-  <a href="">
+  <a href="https://github.com/itsmarianmc/study-archive/blob/main/TUTORIAL.md">
     <img alt="generic" height="56" src="https://cdn.jsdelivr.net/npm/@intergrav/devins-badges@3/assets/cozy/documentation/generic_vector.svg">
   </a>
 </p>
@@ -200,13 +200,6 @@ Ready-to-use systemd service + timer files are included under `deploy/` if you w
 - The rename/delete/upload API routes have no auth of their own. Put something in front of the site (a reverse proxy with basic auth, Cloudflare Access, Tailscale, etc.) before exposing this beyond your own network.
 
 ## License
-
-MIT. *(A `LICENSE` file isn't in the repo yet - add one before treating this as legally binding elsewhere.)*
-
-<h1></h1>
-<p align="center">
-    <span>&copy; 2026 <a href="https://github.com/itsmarianmc/">itsmarian</a> | All rights reserved.</span>
-</p>
 
 MIT - see the [LICENSE](./LICENSE) file for details.
 
