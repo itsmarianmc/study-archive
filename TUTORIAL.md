@@ -1,6 +1,22 @@
-# Local Study Archive - Implementation Plan
+# Study Archive - Implementation Plan
 
-Architecture: 24/7 Server (hosts the website, database, and files) <-> LAN/Tailscale <-> Ollama Server (only on when in use)
+<p align="center">
+    <a href="https://github.com/itsmarianmc/study-archive/">
+        <img alt="github" height="56" src="https://cdn.jsdelivr.net/npm/@intergrav/devins-badges@3/assets/cozy/available/github_vector.svg">
+    </a>
+    &nbsp;
+    <a href="">
+        <img alt="kofi-singular" height="56" src="https://cdn.jsdelivr.net/npm/@intergrav/devins-badges@3/assets/cozy/donate/kofi-singular_vector.svg">
+    </a>
+    &nbsp;
+    <a href="https://github.com/itsmarianmc/study-archive/blob/main/TUTORIAL.md">
+        <img src="https://cdn.jsdelivr.net/npm/@intergrav/devins-badges@3/assets/compact/documentation/generic_vector.svg" alt="Documentation" height="56">
+    </a>
+</p>
+
+---
+
+Architecture: an App Server (hosts the website, database, and files) talks over HTTP to an Ollama Host running the vision/text models. These can be the exact same machine, or two separate machines connected over a LAN or a VPN like Tailscale, whatever fits your hardware.
 
 ---
 
@@ -8,7 +24,7 @@ Architecture: 24/7 Server (hosts the website, database, and files) <-> LAN/Tails
 
 **Goal:** Reliably detect new files in the study material folder without reacting to files that are still being written.
 
-**Where:** Everything on the **24/7 Server**.
+**Where:** Everything on the **App Server**.
 
 ```
 /home/marian/study-archive/
@@ -95,9 +111,14 @@ export interface WatchedFile {
 ```typescript
 import chokidar from "chokidar";
 import path from "path";
+import fs from "fs";
 import { enqueueFile } from "../db/queue";
 
 const WATCH_ROOT = path.resolve(__dirname, "../../data/material");
+
+function sidecarPath(filePath: string): string {
+    return path.join(path.dirname(filePath), `.${path.basename(filePath)}.meta.json`);
+}
 
 const watcher = chokidar.watch(WATCH_ROOT, {
     ignored: (filePath, stats) => {
@@ -116,7 +137,26 @@ const watcher = chokidar.watch(WATCH_ROOT, {
 watcher.on("add", (filePath) => {
     const folder = path.basename(path.dirname(filePath));
     const filename = path.basename(filePath);
-    enqueueFile({ path: filePath, folder, filename, detectedAt: new Date() });
+
+    let userTitle: string | undefined;
+    let userSummary: string | undefined;
+    let notes: string | undefined;
+
+    const metaPath = sidecarPath(filePath);
+    if (fs.existsSync(metaPath)) {
+        try {
+            const meta = JSON.parse(fs.readFileSync(metaPath, "utf-8"));
+            userTitle = typeof meta.title === "string" ? meta.title : undefined;
+            userSummary = typeof meta.summary === "string" ? meta.summary : undefined;
+            notes = typeof meta.notes === "string" ? meta.notes : undefined;
+        } catch (err) {
+            console.error(`[watcher] failed to read sidecar meta for ${filename}:`, err);
+        } finally {
+            fs.unlinkSync(metaPath);
+        }
+    }
+
+    enqueueFile({ path: filePath, folder, filename, detectedAt: new Date(), userTitle, userSummary, notes });
     console.log(`[watcher] new file detected: ${folder}/${filename}`);
 });
 
@@ -124,6 +164,8 @@ watcher.on("error", (err) => console.error("[watcher] error:", err));
 
 console.log(`[watcher] watching ${WATCH_ROOT}`);
 ```
+
+> This already includes the Phase 11 sidecar-override handling (`.filename.meta.json`) so the final file matches what's actually in the repo - see Phase 11 for why it's there. The watcher itself was still built first, before the upload form and its overrides existed.
 
 ### Watch out for:
 
@@ -137,9 +179,9 @@ console.log(`[watcher] watching ${WATCH_ROOT}`);
 
 ## Phase 2: SQLite Schema & Offline Queue
 
-**Goal:** Every detected file gets a status. If Ollama on the Ollama Server is unreachable, the file stays `pending` and is automatically retried once it's back online. No Redis, no message broker needed, at this volume (a handful of files per day) SQLite is entirely sufficient as a queue.
+**Goal:** Every detected file gets a status. If Ollama on the Ollama Host is unreachable, the file stays `pending` and is automatically retried once it's back online. No Redis, no message broker needed, at this volume (a handful of files per day) SQLite is entirely sufficient as a queue.
 
-**Where:** 24/7 Server, `src/db/`
+**Where:** App Server, `src/db/`
 
 ### `src/db/schema.sql`
 
@@ -159,16 +201,23 @@ CREATE TABLE IF NOT EXISTS documents (
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
     detected_at TEXT NOT NULL,
-    processed_at TEXT
+    processed_at TEXT,
+    user_title TEXT,
+    user_summary TEXT,
+    notes TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
 CREATE INDEX IF NOT EXISTS idx_documents_folder ON documents(folder);
 ```
 
+> `user_title`, `user_summary`, and `notes` are shown here already even though they're not needed until Phase 11's manual overrides. Since `schema.sql` only runs `CREATE TABLE IF NOT EXISTS`, it never touches a table that already exists, existing installs need the migration in `queue.ts` below to pick up the new columns, that's exactly what it's for.
+
 `detected_at` is set the moment the watcher sees the file, before anything is sent to Ollama. This column is the actual upload timestamp and stays fixed for the lifetime of the row. `doc_date`, by contrast, is filled in later by the model itself (Phase 3) and reflects whatever date it thinks the study material is *about* - not when it arrived. The frontend (Phase 5) needs to read from `detected_at` for anything labeled "upload date"; reading `doc_date` there instead is a common mix-up since both are dates on the same row, but they answer different questions.
 
 ### `src/db/queue.ts`
+
+> This already includes the migration and the `user_title`/`user_summary`/`notes` handling from Phase 11's manual overrides, and `markDone()`'s `COALESCE` preference for them, so this matches the final file in the repo. They're pointed out again where they're actually motivated, in Phase 11.
 
 ```typescript
 import Database from "better-sqlite3";
@@ -183,16 +232,29 @@ db.pragma("journal_mode = WAL");
 const schema = fs.readFileSync(path.resolve(__dirname, "schema.sql"), "utf-8");
 db.exec(schema);
 
-export function enqueueFile(file: WatchedFile) {
+// Migration for databases created before these columns existed.
+const existingColumns = new Set(
+    (db.prepare(`PRAGMA table_info(documents)`).all() as { name: string }[]).map((c) => c.name)
+);
+for (const col of ["user_title", "user_summary", "notes"]) {
+    if (!existingColumns.has(col)) {
+        db.exec(`ALTER TABLE documents ADD COLUMN ${col} TEXT`);
+    }
+}
+
+export function enqueueFile(file: WatchedFile & { userTitle?: string; userSummary?: string; notes?: string }) {
     const stmt = db.prepare(`
-        INSERT OR IGNORE INTO documents (folder, filename, file_path, status, detected_at)
-        VALUES (@folder, @filename, @path, 'pending', @detectedAt)
+        INSERT OR IGNORE INTO documents (folder, filename, file_path, status, detected_at, user_title, user_summary, notes)
+        VALUES (@folder, @filename, @path, 'pending', @detectedAt, @userTitle, @userSummary, @notes)
     `);
     stmt.run({
         folder: file.folder,
         filename: file.filename,
         path: file.path,
         detectedAt: file.detectedAt.toISOString(),
+        userTitle: file.userTitle ?? null,
+        userSummary: file.userSummary ?? null,
+        notes: file.notes ?? null,
     });
 }
 
@@ -209,8 +271,11 @@ export function markProcessing(id: number) {
 export function markDone(id: number, data: { title: string; docDate: string; tags: string[]; summary: string; rawText: string; htmlPath: string }) {
     db.prepare(`
         UPDATE documents
-        SET status = 'done', title = @title, doc_date = @docDate, tags = @tags,
-            summary = @summary, raw_text = @rawText, html_path = @htmlPath,
+        SET status = 'done',
+            title = COALESCE(NULLIF(user_title, ''), @title),
+            doc_date = @docDate, tags = @tags,
+            summary = COALESCE(NULLIF(user_summary, ''), @summary),
+            raw_text = @rawText, html_path = @htmlPath,
             processed_at = @processedAt
         WHERE id = @id
     `).run({
@@ -269,7 +334,7 @@ tick();
 - **Don't forget SQLite WAL mode** (`journal_mode = WAL`). Without it, write and read access (pipeline writing, website reading) block each other, which leads to `SQLITE_BUSY` errors.
 - **Set an `attempts` limit.** Without a ceiling (5 here) the system will hammer a broken file forever, e.g. a corrupted PDF that can never be processed successfully.
 - **Never run two worker processes at the same time.** Since SQLite only cleanly tolerates one writer at a time, a single `worker-loop` process is enough. If needed later, `BEGIN IMMEDIATE` transactions could allow more concurrency, but that's unnecessary at this volume.
-- The worker runs best as its own systemd service or Docker container on the 24/7 Server, separate from the web server, so that a pipeline crash doesn't take the website down with it.
+- The worker runs best as its own systemd service or Docker container on the App Server, separate from the web server, so that a pipeline crash doesn't take the website down with it.
 - Log `err.cause` alongside `err.message` in the catch block. Generic errors like "fetch failed" hide the actual reason (DNS failure, connection refused, timeout) in the `cause` field, which is otherwise invisible.
 - **A document sitting at `status = 'pending'` or `'processing'` is not an error state**, it's simply not finished yet. The frontend (Phase 5 and Phase 8) reads these rows separately from `'done'` rows so the person uploading a file can see it's in the queue instead of wondering whether the upload even worked.
 
@@ -277,11 +342,11 @@ tick();
 
 ## Phase 3: Ollama LAN Access & Vision Pipeline
 
-**Goal:** The 24/7 Server can reach the Ollama Server over its local IP, reliably and safely enough for a home network.
+**Goal:** The App Server can reach the Ollama Host over its local IP, reliably and safely enough for a home network.
 
-**Where:** `ollama-main-pc/docker-compose.yml` and `ollama-main-pc/README.md` live in their own folder inside the repo, but only ever get copied to and run on the **Ollama Server**. Client code (`ollama-client.ts`) stays on the **24/7 Server**, in the main `src/pipeline/` tree. Keeping the two docker-compose files in clearly separate folders (this one, and the root one from Phase 6) avoids ever accidentally running the wrong compose file on the wrong machine.
+**Where:** `ollama-host/docker-compose.yml` and `ollama-host/README.md` live in their own folder inside the repo, but only ever get copied to and run on the **Ollama Host**. Client code (`ollama-client.ts`) stays on the **App Server**, in the main `src/pipeline/` tree. Keeping the two docker-compose files in clearly separate folders (this one, and the root one from Phase 6) avoids ever accidentally running the wrong compose file on the wrong machine.
 
-### `ollama-main-pc/docker-compose.yml`
+### `ollama-host/docker-compose.yml`
 
 ```yaml
 services:
@@ -313,12 +378,12 @@ volumes:
 Pull the model (if not already present):
 
 ```bash
-cd ollama-main-pc
+cd ollama-host
 docker compose up -d
 docker exec ollama ollama pull qwen3.5:9b-q8_0
 ```
 
-`ollama-main-pc/README.md` covers this same startup sequence plus the LAN and firewall notes below, condensed into a copy-pasteable form for whoever is sitting at the Ollama Server, so the full reasoning doesn't need to be re-read every time Ollama needs restarting.
+`ollama-host/README.md` covers this same startup sequence plus the LAN and firewall notes below, condensed into a copy-pasteable form for whoever is sitting at the Ollama Host, so the full reasoning doesn't need to be re-read every time Ollama needs restarting.
 
 `qwen3.5:9b-q8_0` takes on both roles in this project (vision OCR and text structuring), since its capabilities include both vision and text/tools, and at roughly 10GB it fits comfortably into a 16GB VRAM card. A larger, text-only model would be unnecessarily heavy for the structuring task alone and could end up partially offloaded to CPU/RAM, which slows requests down noticeably and can trigger timeout errors.
 
@@ -339,9 +404,9 @@ Ollama has **no built-in authentication**. Anyone on the same network can use th
 - the firewall rule truly only allows your LAN subnet, not `0.0.0.0/0`
 - Ollama is never exposed through the Cloudflare Tunnel (only the actual website goes through Cloudflare, Ollama stays strictly LAN-only)
 
-If remote access is ever needed (24/7 Server and Ollama Server not on the same network), Tailscale is the cleaner solution over router port forwarding: encrypted, no open port facing the internet, both devices see each other through a fixed Tailscale IP.
+If remote access is ever needed (App Server and Ollama Host not on the same network), Tailscale is the cleaner solution over router port forwarding: encrypted, no open port facing the internet, both devices see each other through a fixed Tailscale IP.
 
-### `src/pipeline/ollama-client.ts` (24/7 Server)
+### `src/pipeline/ollama-client.ts` (App Server)
 
 ```typescript
 const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434";
@@ -429,10 +494,10 @@ There is currently **no dedicated benchmark specifically for handwriting recogni
 
 ### Watch out for:
 
-- **Windows + `OLLAMA_HOST` bug.** There is a known, currently unresolved bug where Windows Ollama installations remain reachable only via `localhost` despite `OLLAMA_HOST=0.0.0.0` being set correctly, the host IP or `0.0.0.0` simply doesn't respond. If the Ollama Server runs Windows and the 24/7 Server still gets "connection refused" after correct configuration: run Ollama inside Docker on Windows instead (as in the compose file above), since the port mapping there sidesteps the issue, or try WSL2.
-- **CORS usually isn't an issue here**, because the 24/7 Server backend (Node.js) makes the request, not a browser directly. `OLLAMA_ORIGINS` is only needed if a browser ever talks to Ollama directly.
+- **Windows + `OLLAMA_HOST` bug.** There is a known, currently unresolved bug where Windows Ollama installations remain reachable only via `localhost` despite `OLLAMA_HOST=0.0.0.0` being set correctly, the host IP or `0.0.0.0` simply doesn't respond. If the Ollama Host runs Windows and the App Server still gets "connection refused" after correct configuration: run Ollama inside Docker on Windows instead (as in the compose file above), since the port mapping there sidesteps the issue, or try WSL2.
+- **CORS usually isn't an issue here**, because the App Server backend (Node.js) makes the request, not a browser directly. `OLLAMA_ORIGINS` is only needed if a browser ever talks to Ollama directly.
 - **The model stays loaded, consumes VRAM.** `OLLAMA_KEEP_ALIVE=10m` keeps the model in memory for 10 minutes after the last request. Convenient for processing several files in a row, but if you're gaming at the same time, that can compete for VRAM, consider lowering it to `5m` or `0` (unload immediately).
-- **Test with `curl` before debugging the whole pipeline:** `curl http://localhost:11434/api/tags` from the 24/7 Server. If that already fails, it's a network/firewall issue, not a code issue.
+- **Test with `curl` before debugging the whole pipeline:** `curl http://localhost:11434/api/tags` from the App Server. If that already fails, it's a network/firewall issue, not a code issue.
 
 ---
 
@@ -440,7 +505,7 @@ There is currently **no dedicated benchmark specifically for handwriting recogni
 
 **Goal:** A clean, consistent static HTML page per document, with the model filling in content only, never the structure.
 
-**Where:** 24/7 Server, `src/pipeline/`
+**Where:** App Server, `src/pipeline/`
 
 ### `src/pipeline/templates/document.html` (template with placeholders)
 
@@ -466,6 +531,12 @@ There is currently **no dedicated benchmark specifically for handwriting recogni
         <section class="summary">
             <p>{{summary}}</p>
         </section>
+        <section class="notes">
+            <h2>Notes</h2>
+            <textarea id="notes-input" placeholder="Your own notes for this document (not AI-generated)…"></textarea>
+            <button id="notes-save-btn" class="option-btn" type="button">Save notes</button>
+            <span id="notes-status" class="notes-status"></span>
+        </section>
         <section class="content">
             {{contentHtml}}
         </section>
@@ -484,10 +555,40 @@ There is currently **no dedicated benchmark specifically for handwriting recogni
             </div>
         </footer>
     </article>
+    <script>
+        (function () {
+            const docId = "{{id}}";
+            const textarea = document.getElementById("notes-input");
+            const saveBtn = document.getElementById("notes-save-btn");
+            const status = document.getElementById("notes-status");
+
+            fetch(`/api/documents/${docId}`)
+                .then((res) => res.json())
+                .then((data) => { textarea.value = data.notes || ""; })
+                .catch(() => { status.textContent = "Could not load notes."; });
+
+            saveBtn.addEventListener("click", () => {
+                status.textContent = "Saving…";
+                fetch(`/api/documents/${docId}`, {
+                    method: "PATCH",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ notes: textarea.value }),
+                })
+                    .then((res) => {
+                        if (!res.ok) throw new Error();
+                        status.textContent = "Saved.";
+                        setTimeout(() => { status.textContent = ""; }, 2000);
+                    })
+                    .catch(() => { status.textContent = "Save failed."; });
+            });
+        })();
+    </script>
 </body>
 </html>
 
 ```
+
+The `<script>` block is what makes the Notes section (Phase 11) work on a page that's otherwise static generated HTML, not a live React component: it fetches the current notes for `{{id}}` from the same `GET /api/documents/[id]` route the sidebar overrides use, and `PATCH`es them back on save, via `updateDocumentNotes()` (Phase 9's writable DB connection).
 
 ### `src/pipeline/generate-html.ts`
 
@@ -518,6 +619,7 @@ export function generateDocumentHtml(doc: DocumentData): string {
         .join("\n");
 
     const html = template
+        .replaceAll("{{id}}", String(doc.id))
         .replaceAll("{{title}}", escapeHtml(doc.title))
         .replaceAll("{{folder}}", escapeHtml(doc.folder))
         .replaceAll("{{uploadDate}}", doc.uploadDate)
@@ -612,27 +714,31 @@ export async function processDocument(job: any) {
     }
 
     const structured = await structureText(rawText);
+    const finalTitle = (job.user_title && job.user_title.trim()) || structured.title;
+    const finalSummary = (job.user_summary && job.user_summary.trim()) || structured.summary;
 
     const htmlPath = generateDocumentHtml({
         id: job.id,
-        title: structured.title,
+        title: finalTitle,
         folder: job.folder,
         uploadDate: job.detected_at,
         tags: structured.tags,
-        summary: structured.summary,
+        summary: finalSummary,
         rawText,
     });
 
     return {
-        title: structured.title,
+        title: finalTitle,
         docDate: structured.docDate,
         tags: structured.tags,
-        summary: structured.summary,
+        summary: finalSummary,
         rawText,
         htmlPath,
     };
 }
 ```
+
+> The `finalTitle`/`finalSummary` fallback here overlaps with `markDone()`'s own `COALESCE` (Phase 2): this is the value actually baked into the generated HTML page at processing time, the `COALESCE` in SQL is a second, independent safety net for the database row itself. Both exist because `job.user_title`/`job.user_summary` come from the sidecar file (Phase 11) and could in theory still be empty strings rather than `null` depending on how the form was submitted.
 
 **Note on the footer strip:** `pdf-parse` sometimes extracts page-footer artifacts like page counters along with the real content. The regex above strips that out before the text ever reaches the model or the generated HTML page.
 
@@ -694,7 +800,7 @@ This re-reads every `done` document straight from the database and calls `genera
 
 **Goal:** A publicly reachable overview of all documents, with search/filter, behind Cloudflare Access.
 
-**Where:** 24/7 Server, its own Next.js project (can live in the same repo as a separate folder)
+**Where:** App Server, its own Next.js project (can live in the same repo as a separate folder)
 
 ```
 /home/marian/study-archive/
@@ -764,6 +870,7 @@ Reachable at `http://localhost:3000`, but only shows content once the watcher/pi
         "lint": "eslint"
     },
     "dependencies": {
+        "@notionhq/client": "^2.2.15",
         "better-sqlite3": "^11.3.0",
         "next": "^15.4.0",
         "react": "^19.0.0",
@@ -782,6 +889,8 @@ Reachable at `http://localhost:3000`, but only shows content once the watcher/pi
 ```
 
 After writing it, `npm install` inside `web/` to actually install these into `node_modules` before the `npm run dev` check above.
+
+> `@notionhq/client` isn't needed yet at this point in the tutorial, it's only used by `web/app/api/sync/route.ts` (Phase 10's on-demand sync button), which runs the same sync logic as `src/scripts/notion-sync.ts` directly inside the web container so a manual sync doesn't need shell access. It's listed here because this is the final `package.json` from the repo; installing it now doesn't hurt anything, it just sits unused until Phase 10.
 
 ### `web/tsconfig.json`
 
@@ -855,6 +964,7 @@ export interface DocumentRow {
     html_path: string;
     status: string;
     detected_at: string;
+    notes: string | null;
 }
 
 export interface ProcessingDocumentRow {
@@ -871,6 +981,11 @@ export function getDocuments(folder?: string): DocumentRow[] {
         return db.prepare(`SELECT * FROM documents WHERE status = 'done' AND folder = ? ORDER BY detected_at DESC`).all(folder) as DocumentRow[];
     }
     return db.prepare(`SELECT * FROM documents WHERE status = 'done' ORDER BY detected_at DESC`).all() as DocumentRow[];
+}
+
+export function getAllDocuments(): DocumentRow[] {
+    const db = getDb();
+    return db.prepare(`SELECT * FROM documents ORDER BY detected_at DESC`).all() as DocumentRow[];
 }
 
 export function getProcessingDocuments(folder?: string): ProcessingDocumentRow[] {
@@ -900,6 +1015,10 @@ export function renameDocument(id: number, title: string): void {
     getWritableDb().prepare(`UPDATE documents SET title = ? WHERE id = ?`).run(title, id);
 }
 
+export function updateDocumentNotes(id: number, notes: string): void {
+    getWritableDb().prepare(`UPDATE documents SET notes = ? WHERE id = ?`).run(notes, id);
+}
+
 export function deleteDocumentRow(id: number): void {
     getWritableDb().prepare(`DELETE FROM documents WHERE id = ?`).run(id);
 }
@@ -921,6 +1040,8 @@ export function deleteFolderRows(folder: string): void {
 
 **Why `DocumentRow` includes `raw_text`:** the search feature added to `page.tsx` and `/api/documents/route.ts` (below) matches against the full extracted text of a document, not just its title and tags, so a query for a term buried in the body of a page still finds it. `raw_text` was always a column in `documents` (Phase 2), it just wasn't part of this interface until search needed it.
 
+> `notes`, `getAllDocuments()`, and `updateDocumentNotes()` are also already here even though nothing in Phase 5 uses them yet. `getAllDocuments()` (unfiltered by `status`) is what `web/app/api/sync/route.ts` needs in Phase 10, so a freshly uploaded, still-`pending` document also gets mirrored into Notion right away instead of only appearing once processing finishes. `updateDocumentNotes()` is Phase 11's manual notes field.
+
 **`getProcessingDocuments`:** documents with `status` `pending` or `processing` haven't been through `structureText()` yet (Phase 3), so they have no `title`, `tags`, or `summary` yet, only `filename` and `detected_at` are guaranteed to exist. The interface reflects that: `ProcessingDocumentRow` only exposes the columns that are actually populated at that stage.
 
 ### `web/app/page.tsx`
@@ -929,6 +1050,7 @@ export function deleteFolderRows(folder: string): void {
 import { getDocuments, getProcessingDocuments, DocumentRow, ProcessingDocumentRow } from "@/lib/db";
 import { formatUploadDate } from "@/lib/search";
 import FolderGroup from "./components/FolderGroup";
+import SyncButton from "./components/SyncButton";
 
 export const dynamic = "force-dynamic";
 
@@ -939,7 +1061,8 @@ function filterDocuments(docs: DocumentRow[], query: string): DocumentRow[] {
         const tagsString = doc.tags || "";
         const dateString = formatUploadDate(doc.detected_at).toLowerCase();
         const content = doc.raw_text || "";
-        const haystack = `${doc.title} ${doc.summary} ${tagsString} ${content} ${dateString}`.toLowerCase();
+        const notes = doc.notes || "";
+        const haystack = `${doc.title} ${doc.summary} ${tagsString} ${content} ${notes} ${dateString}`.toLowerCase();
         return haystack.includes(q);
     });
 }
@@ -981,10 +1104,17 @@ export default async function Home({ searchParams }: { searchParams: Promise<{ q
     const noResults = query && filteredDocs.length === 0 && processingDocs.length === 0;
 
     return (
-        <main>
-            <h1>Study Archive</h1>
-            <div className="header-elements">
-                <a className="upload-link" href="/upload">+ Add document</a>
+        <>
+            <header className="page-header">
+                <div className="page-header-top">
+                    <h1>Study Archive</h1>
+                    <div className="page-header-actions">
+                        <a className="icon-button" href="/upload" aria-label="Add document" title="Add document">
+                            <i className="fa-solid fa-plus"></i>
+                        </a>
+                        <SyncButton />
+                    </div>
+                </div>
                 <form method="GET" className="search-form">
                     <input
                         type="text"
@@ -995,23 +1125,27 @@ export default async function Home({ searchParams }: { searchParams: Promise<{ q
                     />
                     <button type="submit" className="search-submit"><i className="fa fa-search"></i></button>
                 </form>
-            </div>
+            </header>
 
-            {folderGroups.map((group) => (
-                <FolderGroup
-                    key={group.folder}
-                    folder={group.folder}
-                    processing={group.processing}
-                    docs={group.docs}
-                    query={query}
-                />
-            ))}
+            <main>
+                {folderGroups.map((group) => (
+                    <FolderGroup
+                        key={group.folder}
+                        folder={group.folder}
+                        processing={group.processing}
+                        docs={group.docs}
+                        query={query}
+                    />
+                ))}
 
-            {noResults && <p className="no-results">No results for "{query}"</p>}
-        </main>
+                {noResults && <p className="no-results">No results for "{query}"</p>}
+            </main>
+        </>
     );
 }
 ```
+
+> This is the Phase 11-final version of the page: the header was pulled out of `<main>` into its own `<header className="page-header">` so `layout.tsx`'s sticky footer (below) can make `<main>` grow to fill the remaining space, the "+ Add document" text link became an icon button, and a `<SyncButton />` (Phase 10) sits next to it for the on-demand Notion sync. `filterDocuments` also matches against `doc.notes` now, so a note typed on a document's own page becomes searchable too, same reasoning as `raw_text`.
 
 **Why `export const dynamic = "force-dynamic"` matters:** the lazy database connection in `lib/db.ts` only prevents `new Database(...)` from running the moment `db.ts` is imported. It does not stop Next.js from trying to statically prerender this page during `next build`, which executes `getDocuments()` and `getProcessingDocuments()` once at build time regardless. Since the `data` folder doesn't exist yet inside the image at that point, this would fail the build even with a lazy connection. `force-dynamic` tells Next.js to skip prerendering entirely for this page and always render it live, once a real request comes in after the container is running. The two fixes solve different halves of the same problem: the lazy connection avoids failures triggered by mere imports, `force-dynamic` avoids failures triggered by build-time prerendering.
 
@@ -1108,7 +1242,7 @@ A thin JSON endpoint on top of `getDocuments`, useful for any client outside the
 
 **Goal:** Both the processing pipeline and the website run continuously in the background, start automatically after a reboot, and no longer require manually running commands in a terminal.
 
-**Where:** 24/7 Server, project root and `web/`
+**Where:** App Server, project root and `web/`
 
 ### Combine watcher and worker into a single process
 
@@ -1132,12 +1266,15 @@ web
 
 Without this file, `COPY . .` in the Dockerfile below also copies the local `node_modules` folder into the image, overwriting the one that was just correctly compiled inside the container for the container's own Node.js version. That produces a `NODE_MODULE_VERSION mismatch` / `ERR_DLOPEN_FAILED` error from `better-sqlite3`, since its native binary is version-specific to the exact Node.js build it was compiled against.
 
+> **This file isn't actually present in the repo right now.** The images currently get built manually (see "Starting everything" below) from a plain `docker build .` in the project root, which means the risk above is real any time `node_modules` or `dist` happen to exist locally at build time. Add it back before running a local build from a working copy that already has dependencies installed; it's harmless either way, and building from a fresh `git clone` (no local `node_modules` at all) sidesteps the issue too, just less robustly.
+
 ### `Dockerfile` (project root, pipeline)
 
 ```dockerfile
 FROM node:22-slim
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends poppler-utils && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends poppler-utils python3 make g++ \
+    && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json ./
 RUN npm install
 COPY . .
@@ -1145,6 +1282,8 @@ CMD ["npx", "tsx", "src/index.ts"]
 ```
 
 **Why `poppler-utils`:** provides `pdftoppm`, used later (Phase 9) as a fallback to rasterize a PDF page and OCR it with the vision model when the PDF's text layer turns out to be unusable.
+
+**Why `python3 make g++`:** `better-sqlite3` ships as a native addon and needs to compile from source for whatever platform/Node version the image actually runs on if a prebuilt binary isn't available for it (`node-gyp`'s build toolchain). Without these three packages, `npm install` fails inside the container with a `gyp: No Xcode or CLT version detected` / `make: not found`-style error even though the exact same `npm install` works fine on a dev machine that already has a C++ toolchain installed globally.
 
 ### `web/.dockerignore`
 
@@ -1179,6 +1318,8 @@ export default nextConfig;
 ```dockerfile
 FROM node:22-slim AS builder
 WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ \
+    && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json ./
 RUN npm install
 COPY . .
@@ -1194,37 +1335,43 @@ EXPOSE 3000
 CMD ["node", "server.js"]
 ```
 
-The build stage compiles the project with all dev dependencies present, the runner stage only keeps the compiled standalone output, keeping the final image small. `ENV DATA_ROOT=/app/data` is what makes `lib/db.ts` and `route.ts` resolve paths correctly inside the container, matching the volume mount defined below.
+The build stage compiles the project with all dev dependencies present, the runner stage only keeps the compiled standalone output, keeping the final image small. `ENV DATA_ROOT=/app/data` is what makes `lib/db.ts` and `route.ts` resolve paths correctly inside the container, matching the volume mount defined below. The same `python3 make g++` toolchain as the pipeline's `Dockerfile` is needed here too, for the exact same reason: `web/package.json` also depends on `better-sqlite3` (Phase 5), and the build stage is where it gets compiled.
 
 ### `docker-compose.yml` (project root, combining both services)
 
 ```yaml
 services:
     study-archive-pipeline:
-        build: .
         image: study-archive-pipeline:latest
         container_name: study-archive-pipeline
         restart: unless-stopped
         environment:
             - OLLAMA_URL=http://localhost:11434
+            - NOTION_TOKEN=${NOTION_TOKEN}
+            - NOTION_DATABASE_ID=${NOTION_DATABASE_ID}
+            - STUDY_ARCHIVE_BASE_URL=${STUDY_ARCHIVE_BASE_URL}
         volumes:
             - /home/marian/study-archive/data:/app/data
 
     study-archive-web:
-        build: ./web
         image: study-archive-web:latest
         container_name: study-archive-web
         restart: unless-stopped
         ports:
             - "1920:3000"
+        environment:
+            - NOTION_TOKEN=${NOTION_TOKEN}
+            - NOTION_DATABASE_ID=${NOTION_DATABASE_ID}
+            - STUDY_ARCHIVE_BASE_URL=${STUDY_ARCHIVE_BASE_URL}
         volumes:
             - /home/marian/study-archive/data:/app/data
         depends_on:
             - study-archive-pipeline
 ```
 
-Three details worth noting:
-- The `image:` field gives each build a stable, predictable tag (`study-archive-pipeline:latest`, `study-archive-web:latest`). Without it, Compose still names the image automatically, but an explicit tag makes it easier to reference the same image from other tools (a Portainer stack, a manual `docker run`, a backup script) without depending on Compose's naming convention.
+Four details worth noting:
+- **No `build:` keys.** Earlier versions of this file had `build: .` and `build: ./web` here, so `docker compose up --build` could build both images directly. The final setup instead builds each image explicitly with a plain `docker build` command (see "Starting everything" below) and only ever references the resulting tags here. This matters for a Portainer-managed stack in particular: Portainer's own "build from repository" flow, or a manually pushed/loaded image, both expect `docker-compose.yml` to just consume an existing `image:`, not try to build one itself from a build context Portainer doesn't have local access to.
+- The `image:` field gives each build a stable, predictable tag (`study-archive-pipeline:latest`, `study-archive-web:latest`). Even without a `build:` key, this is what lets Compose (or Portainer) find the right already-built image by name.
 - The volume mounts use an **absolute path** (`/home/marian/study-archive/data`) instead of a relative one (`./data`). Relative paths in a bind mount are resolved relative to wherever `docker compose` happens to be invoked from, which is normally the file's own directory but can silently break if the same compose file is ever triggered from a different working directory (a cron job, a Portainer-managed stack, a systemd unit). An absolute path removes that ambiguity entirely.
 - The external port is `1920` rather than `3000`. This is purely a host-side choice, the container still listens on `3000` internally (`EXPOSE 3000` in `web/Dockerfile`, matched by `next start`'s default port), only the mapping on the left side of `"1920:3000"` changed. Useful if port 3000 on the host is already used by something else, or simply a personal preference for which port the site should answer on.
 
@@ -1233,24 +1380,30 @@ Two further details carried over from earlier:
 - The web service's mount used to be read-only (`:ro`) in earlier versions of this plan, on the reasoning that the website should only ever read the database and generated files. That still holds for the database: `web/lib/db.ts` opens the SQLite connection with `readonly: true` at the code level regardless of filesystem permissions. But Phase 7 adds an upload page that writes new files into `data/material/`, which needs the web container to have write access to that path. The mount was changed to read-write for that reason; the database itself stays protected by the code-level readonly flag either way.
 - `depends_on` only controls startup order, it doesn't guarantee Ollama or the database are already populated by the time the website starts, that's fine since an empty database just renders an empty list rather than crashing.
 
+`NOTION_TOKEN`, `NOTION_DATABASE_ID`, and `STUDY_ARCHIVE_BASE_URL` (Phase 10) are passed into *both* containers here: the pipeline needs them for the scheduled `npm run sync:notion` run (or its systemd timer, see Phase 10), the web container needs them for the on-demand `web/app/api/sync/route.ts`. Both read from the same `.env` file sitting next to `docker-compose.yml`, via Compose's `${VAR}` substitution, unlike `OLLAMA_URL` above, which is still hardcoded directly instead of substituted, an inconsistency carried over from Phase 6 that never got cleaned up once the Notion vars were added following the recommended pattern.
+
 ### Starting everything
 
 ```bash
 cd ~/study-archive
-docker compose up -d --build
+docker build -t study-archive-pipeline:latest .
+docker build -t study-archive-web:latest ./web
+docker compose up -d
 docker compose logs -f
 ```
+
+Since `docker-compose.yml` no longer has `build:` keys, `docker compose up --build` has nothing to build and Compose will just start whatever the `image:` tags currently point to (or fail to start at all, if they were never built once). Build both images explicitly first, then bring the stack up. A Portainer-managed deployment does the equivalent by building each image separately (or pulling them from wherever they're pushed) before deploying the stack.
 
 From here on, dropping a new file into `data/material/<subject>/` is picked up automatically, gets processed automatically, and shows up on the website automatically, no manual status resets or restarts required. Failed or pending jobs are retried automatically by the worker loop once Ollama is reachable again, that logic was already built in during Phase 2.
 
 ### Watch out for:
 
-- **Build context size.** If `docker compose build` reports transferring hundreds of MB of build context, the `.dockerignore` isn't being picked up, double-check it sits directly next to the relevant `Dockerfile`.
-- **Rebuild after code changes, not just restart.** `docker compose restart` reuses the existing image; after editing source files, `docker compose up -d --build` is required to actually rebuild.
-- **The `bindings.js` / `NODE_MODULE_VERSION` error** almost always traces back to a missing or incomplete `.dockerignore`, not a real dependency problem, check that first before reinstalling anything.
+- **Build context size.** If `docker build` reports transferring hundreds of MB of build context, the `.dockerignore` isn't being picked up, double-check it sits directly next to the relevant `Dockerfile`.
+- **Rebuild after code changes, not just restart.** `docker compose restart` reuses the existing image; after editing source files, rerun the two `docker build` commands above and then `docker compose up -d` again to actually pick up the new image.
+- **The `bindings.js` / `NODE_MODULE_VERSION` error** almost always traces back to a missing or incomplete `.dockerignore` (or, per the note above, a missing native build toolchain), not a real dependency problem, check both before reinstalling anything.
 - Development with hot reload (`npm run dev` inside `web/`) remains useful while actively coding; the containerized build here is for the "just keeps running" production setup.
-- **A `.env` file with `OLLAMA_URL=http://localhost:11434` can sit next to `docker-compose.yml`,** but on its own it has no effect: Compose only substitutes `.env` values into the file when the YAML actually references them as `${OLLAMA_URL}`, and the `environment:` block above currently hardcodes the value directly instead. Likewise, `dotenv` being listed as a dependency doesn't load anything by itself, that only happens if some file explicitly calls `import "dotenv/config"` (useful for running `src/index.ts` directly with `npx tsx` outside Docker, where Compose's own `.env` handling doesn't apply). If the intent is for `.env` to be the single source of truth, either change the compose value to `${OLLAMA_URL}` and keep `.env` next to the compose file, or add `import "dotenv/config"` to the top of `src/index.ts` for the non-Docker path. Right now the file is present but not yet wired into either.
-- **The Ollama setup now lives in its own `ollama-main-pc/` folder** (its `docker-compose.yml` and a dedicated `README.md`) rather than being documented only inline here, see the note at the start of Phase 3. Keep both README files honest about which machine each `docker compose up` command is meant to run on, since a `docker-compose.yml` copied to the wrong machine will fail confusingly (no GPU passthrough on the 24/7 Server, no exposed website port on the Ollama Server).
+- **A `.env` file next to `docker-compose.yml`** is what actually supplies `NOTION_TOKEN`, `NOTION_DATABASE_ID`, and `STUDY_ARCHIVE_BASE_URL` via `${VAR}` substitution. `OLLAMA_URL` in the `environment:` block is still hardcoded rather than substituted from `.env`, so changing it means editing `docker-compose.yml` directly, not the `.env` file, that's a known inconsistency, not a mistake to "fix" by adding `${OLLAMA_URL}` without also confirming nothing else depends on the current hardcoded behavior. Likewise, `dotenv` being listed as a dependency doesn't load anything by itself, that only happens if some file explicitly calls `import "dotenv/config"` (used by `src/scripts/notion-sync.ts`, useful for running scripts directly with `npx tsx` outside Docker, where Compose's own `.env` handling doesn't apply).
+- **The Ollama setup now lives in its own `ollama-host/` folder** (its `docker-compose.yml` and a dedicated `README.md`) rather than being documented only inline here, see the note at the start of Phase 3. Keep both README files honest about which machine each `docker compose up` command is meant to run on, since a `docker-compose.yml` copied to the wrong machine will fail confusingly (no GPU passthrough on the App Server, no exposed website port on the Ollama Host).
 
 ---
 
@@ -1258,7 +1411,7 @@ From here on, dropping a new file into `data/material/<subject>/` is picked up a
 
 **Goal:** Add new study material through a form in the browser instead of only through the filesystem, without touching the database directly and without breaking the watcher-based pipeline.
 
-**Where:** 24/7 Server, `web/app/`
+**Where:** App Server, `web/app/`
 
 The key idea is to make the upload endpoint do exactly what a manual file copy would do: write a file into `data/material/<subject>/`. Everything downstream (the watcher detecting it, the queue, the worker, the OCR pipeline) stays completely unchanged, the website never talks to the pipeline directly, it only ever touches the shared `data/material` folder.
 
@@ -1317,6 +1470,9 @@ export async function POST(request: NextRequest) {
     const formData = await request.formData();
     const file = formData.get("file");
     const rawFolder = formData.get("folder");
+    const title = formData.get("title");
+    const summary = formData.get("summary");
+    const notes = formData.get("notes");
 
     if (!(file instanceof File)) {
         return NextResponse.json({ error: "No file was submitted" }, { status: 400 });
@@ -1354,6 +1510,16 @@ export async function POST(request: NextRequest) {
     const buffer = Buffer.from(await file.arrayBuffer());
     fs.writeFileSync(targetPath, buffer);
 
+    const meta: Record<string, string> = {};
+    if (typeof title === "string" && title.trim()) meta.title = title.trim();
+    if (typeof summary === "string" && summary.trim()) meta.summary = summary.trim();
+    if (typeof notes === "string" && notes.trim()) meta.notes = notes.trim();
+
+    if (Object.keys(meta).length > 0) {
+        const metaPath = path.join(targetDir, `.${filename}.meta.json`);
+        fs.writeFileSync(metaPath, JSON.stringify(meta));
+    }
+
     return NextResponse.json({ ok: true, folder, filename });
 }
 ```
@@ -1362,6 +1528,8 @@ export async function POST(request: NextRequest) {
 
 **The extension whitelist mirrors `process-document.ts` from Phase 4** (`.pdf`, `.jpg`, `.jpeg`, `.png`), on purpose: there is no point accepting a file type the pipeline can't process anyway, better to reject it immediately with a clear message than have it sit forever in the `material` folder without ever being picked up cleanly.
 
+**The `title`/`summary`/`notes` sidecar block (Phase 11) is written *after* `fs.writeFileSync(targetPath, buffer)`,** deliberately: it must exist before the watcher's `awaitWriteFinish` fires an `add` event for the real file, but writing it first (before the real file exists) would risk the watcher's own dotfile-ignore pattern racing against a sidecar with nothing to attach to yet. Writing the real file first, then the tiny sidecar right after, keeps the ordering safe in practice since the real file's `stabilityThreshold` (3000ms, Phase 1) gives more than enough headroom for this second, near-instant write to land first.
+
 **Filename collisions** are resolved by appending a timestamp rather than overwriting silently, since `file_path` is `UNIQUE` in the schema (Phase 2) and a silent overwrite of an already-processed file would leave stale data in the database pointing at a file that no longer matches it.
 
 ### `web/app/upload/page.tsx` (the form)
@@ -1369,71 +1537,126 @@ export async function POST(request: NextRequest) {
 ```typescript
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import { useToast } from "../_context/ToastContext";
 
-type Status = { type: "idle" | "success" | "error"; message: string };
+// Unique sentinel value so a real subject folder can never accidentally collide
+// with the "create new" option (sanitizeFolderName on the server only ever
+// produces lowercase a-z0-9- strings, so this dunder value is always safe).
+const CREATE_NEW_SENTINEL = "__create_new_subject__";
+
+function capitalize(name: string): string {
+    return name.length ? name[0].toUpperCase() + name.slice(1) : name;
+}
 
 export default function UploadPage() {
     const [folders, setFolders] = useState<string[]>([]);
     const [selectedFolder, setSelectedFolder] = useState("");
     const [newFolder, setNewFolder] = useState("");
     const [file, setFile] = useState<File | null>(null);
-    const [status, setStatus] = useState<Status>({ type: "idle", message: "" });
+    const [dragActive, setDragActive] = useState(false);
+    const [title, setTitle] = useState("");
+    const [summary, setSummary] = useState("");
+    const [notes, setNotes] = useState("");
     const [submitting, setSubmitting] = useState(false);
+    const [progress, setProgress] = useState(0);
+
+    const fileInputRef = useRef<HTMLInputElement>(null);
+    const router = useRouter();
+    const { showToast } = useToast();
 
     useEffect(() => {
         fetch("/api/folders")
             .then((res) => res.json())
             .then((data: string[]) => {
                 setFolders(data);
-                if (data.length > 0) setSelectedFolder(data[0]);
+                setSelectedFolder(data.length > 0 ? data[0] : CREATE_NEW_SENTINEL);
             })
-            .catch(() => setStatus({ type: "error", message: "Could not load subjects." }));
+            .catch(() => showToast("Could not load subjects.", "toast-error"));
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
-    async function handleSubmit(e: React.FormEvent) {
+    function pickFile(f: File | null) {
+        setFile(f);
+    }
+
+    function handleDrop(e: React.DragEvent<HTMLDivElement>) {
+        e.preventDefault();
+        setDragActive(false);
+        const dropped = e.dataTransfer.files?.[0];
+        if (dropped) pickFile(dropped);
+    }
+
+    function handleSubmit(e: React.FormEvent) {
         e.preventDefault();
 
-        const folder = newFolder.trim() || selectedFolder;
+        const isCreatingNew = selectedFolder === CREATE_NEW_SENTINEL;
+        const folder = isCreatingNew ? newFolder.trim() : selectedFolder;
 
         if (!folder) {
-            setStatus({ type: "error", message: "Please select or create a subject." });
+            showToast(isCreatingNew ? "Please enter a name for the new subject." : "Please select a subject.", "toast-error");
             return;
         }
         if (!file) {
-            setStatus({ type: "error", message: "Please choose a file." });
+            showToast("Please choose a file.", "toast-error");
             return;
         }
-
-        setSubmitting(true);
-        setStatus({ type: "idle", message: "" });
 
         const formData = new FormData();
         formData.append("folder", folder);
         formData.append("file", file);
+        if (title.trim()) formData.append("title", title.trim());
+        if (summary.trim()) formData.append("summary", summary.trim());
+        if (notes.trim()) formData.append("notes", notes.trim());
 
-        try {
-            const res = await fetch("/api/upload", { method: "POST", body: formData });
-            const data = await res.json();
+        setSubmitting(true);
+        setProgress(0);
 
-            if (!res.ok) {
-                setStatus({ type: "error", message: data.error ?? "Upload failed." });
-            } else {
-                setStatus({ type: "success", message: `"${data.filename}" was saved to "${data.folder}" and will be processed automatically.` });
-                setFile(null);
-                setNewFolder("");
-                setSelectedFolder(data.folder);
-                setFolders((prev) => (prev.includes(data.folder) ? prev : [...prev, data.folder].sort()));
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", "/api/upload");
 
-                const input = document.getElementById("file-input") as HTMLInputElement | null;
-                if (input) input.value = "";
+        xhr.upload.addEventListener("progress", (event) => {
+            if (event.lengthComputable) {
+                setProgress(Math.round((event.loaded / event.total) * 100));
             }
-        } catch {
-            setStatus({ type: "error", message: "Upload failed." });
-        } finally {
+        });
+
+        xhr.addEventListener("load", () => {
             setSubmitting(false);
-        }
+            let data: any = null;
+            try {
+                data = JSON.parse(xhr.responseText);
+            } catch {
+                /* ignore */
+            }
+
+            if (xhr.status < 200 || xhr.status >= 300) {
+                showToast(data?.error ?? "Upload failed.", "toast-error");
+                return;
+            }
+
+            showToast(`"${data.filename}" saved to "${data.folder}"`, "toast-success");
+            setFile(null);
+            setNewFolder("");
+            setTitle("");
+            setSummary("");
+            setNotes("");
+            setSelectedFolder(data.folder);
+            setFolders((prev) => (prev.includes(data.folder) ? prev : [...prev, data.folder].sort()));
+            if (fileInputRef.current) fileInputRef.current.value = "";
+            router.refresh();
+        });
+
+        xhr.addEventListener("error", () => {
+            setSubmitting(false);
+            showToast("Upload failed.", "toast-error");
+        });
+
+        xhr.send(formData);
     }
+
+    const isCreatingNew = selectedFolder === CREATE_NEW_SENTINEL;
 
     return (
         <main>
@@ -1442,71 +1665,134 @@ export default function UploadPage() {
 
             <form onSubmit={handleSubmit}>
                 <label>
+                    Title <span className="label-optional">(optional, overrides the AI-generated title)</span>
+                    <input
+                        type="text"
+                        placeholder="e.g. Chapter 4 notes"
+                        value={title}
+                        onChange={(e) => setTitle(e.target.value)}
+                    />
+                </label>
+
+                <label>
+                    Summary <span className="label-optional">(optional, overrides the AI-generated summary)</span>
+                    <textarea
+                        placeholder="A short custom summary…"
+                        value={summary}
+                        onChange={(e) => setSummary(e.target.value)}
+                        rows={3}
+                    />
+                </label>
+
+                <label>
+                    Notes <span className="label-optional">(optional, your own notes, not AI-generated)</span>
+                    <textarea
+                        placeholder="Anything you want to remember about this document…"
+                        value={notes}
+                        onChange={(e) => setNotes(e.target.value)}
+                        rows={3}
+                    />
+                </label>
+
+                <label>
                     Subject
                     <select
                         value={selectedFolder}
                         onChange={(e) => setSelectedFolder(e.target.value)}
-                        disabled={folders.length === 0}
                     >
-                        {folders.length === 0 && <option value="">No subjects available</option>}
+                        <option value={CREATE_NEW_SENTINEL}>+ Create New Subject...</option>
                         {folders.map((folder) => (
                             <option key={folder} value={folder}>
-                                {folder}
+                                {capitalize(folder)}
                             </option>
                         ))}
                     </select>
                 </label>
 
-                <label>
-                    Create new subject (optional)
-                    <input
-                        type="text"
-                        placeholder="e.g. chemistry"
-                        value={newFolder}
-                        onChange={(e) => setNewFolder(e.target.value)}
-                    />
-                </label>
+                {isCreatingNew && (
+                    <label className="new-subject-field">
+                        New subject name
+                        <input
+                            type="text"
+                            placeholder="e.g. Chemistry"
+                            value={newFolder}
+                            onChange={(e) => setNewFolder(e.target.value)}
+                            autoFocus
+                        />
+                    </label>
+                )}
 
                 <label>
                     File (PDF, JPG, PNG)
                     <input
+                        ref={fileInputRef}
                         id="file-input"
                         type="file"
                         accept=".pdf,.jpg,.jpeg,.png"
-                        onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+                        onChange={(e) => pickFile(e.target.files?.[0] ?? null)}
+                        className="sr-only-input"
                     />
+                    <div
+                        className={`dropzone${dragActive ? " dropzone--active" : ""}${file ? " dropzone--filled" : ""}`}
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => fileInputRef.current?.click()}
+                        onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") fileInputRef.current?.click();
+                        }}
+                        onDragOver={(e) => {
+                            e.preventDefault();
+                            setDragActive(true);
+                        }}
+                        onDragLeave={() => setDragActive(false)}
+                        onDrop={handleDrop}
+                    >
+                        {file ? (
+                            <>
+                                <i className="fa-solid fa-file-circle-check"></i>
+                                <span className="dropzone-filename">{file.name}</span>
+                                <span className="dropzone-hint">Click or drop to replace</span>
+                            </>
+                        ) : (
+                            <>
+                                <i className="fa-solid fa-cloud-arrow-up"></i>
+                                <span>Drag & drop a file here, or click to browse</span>
+                                <span className="dropzone-hint">PDF, JPG or PNG</span>
+                            </>
+                        )}
+                    </div>
                 </label>
 
                 <button type="submit" disabled={submitting}>
-                    {submitting ? "Uploading…" : "Upload"}
+                    {submitting ? `Uploading… ${progress}%` : "Upload"}
                 </button>
-            </form>
 
-            {status.type !== "idle" && <p className={`status ${status.type}`}>{status.message}</p>}
+                {submitting && (
+                    <div className="upload-progress">
+                        <div className="upload-progress-bar" style={{ width: `${progress}%` }} />
+                    </div>
+                )}
+            </form>
         </main>
     );
 }
 ```
 
-**Why the subject list comes from `/api/folders` instead of being hardcoded:** the three example subjects from Phase 1 (`math`, `history`, `ethics`) are just a starting point, not a fixed schema. Fetching the real folder list on mount means a subject created through this same form (via "Create new subject") shows up as a normal dropdown option the next time the page loads, without editing any code.
+> This is already the Phase 11 version (drag-and-drop dropzone, upload progress via `XMLHttpRequest`, the title/summary/notes override fields, the "Create New Subject" sentinel merged into the dropdown, and toasts instead of inline status text) rather than the plain bare-bones form Phase 7 originally shipped. The reasoning for each of those additions is covered where they're actually motivated, in Phase 11.
 
-**Why the "create new subject" field is separate from the dropdown, not merged into it:** keeping them apart avoids ambiguity between "pick one of the existing folders" and "type a brand new name", which would otherwise require a special sentinel option like "+ new..." inside the dropdown itself. If both a dropdown selection and a new-subject text exist, the new one wins, since typing a name is a stronger signal of intent than whatever the dropdown happened to default to.
+**Why the subject list comes from `/api/folders` instead of being hardcoded:** the three example subjects from Phase 1 (`math`, `history`, `ethics`) are just a starting point, not a fixed schema. Fetching the real folder list on mount means a subject created through this same form (via "Create New Subject...") shows up as a normal dropdown option the next time the page loads, without editing any code.
+
+**Why "create new subject" ended up as a sentinel option inside the dropdown, not a separate always-visible field (a Phase 11 revision of the original Phase 7 design):** the first version of this form kept them apart, on the reasoning that mixing "pick an existing folder" and "type a new name" into one control would be ambiguous. In practice that meant a second text field sitting there unused on every single upload, for the rare case of adding a subject, worse UX for the common path to slightly simplify the rare one. `CREATE_NEW_SENTINEL` solves the ambiguity a different way: it's a value `sanitizeFolderName()` (Phase 7's upload route) can never produce from real input, so selecting it can never be confused with a real subject, and the extra name field only appears once it's actually needed.
 
 ### Update `web/app/page.tsx`
 
-Add a link to the upload page next to the heading:
-
-```typescript
-<a className="upload-link" href="/upload">+ Add new document</a>
-```
-
-Placed directly under the `<h1>`, see the full file in Phase 5 above (Phase 5 and Phase 8 both touch this file; the version in Phase 5 already includes this line).
+The "+ Add document" entry point sits in `page.tsx`'s header, already shown in full in Phase 5, that file already reflects everything through Phase 11: an icon button (`<i className="fa-solid fa-plus">`) linking to `/upload`, next to the `<SyncButton />` from Phase 10. An earlier revision of this tutorial had it as a plain text link (`<a className="upload-link" href="/upload">+ Add document</a>`); the icon button and the surrounding `page-header`/`page-header-actions` layout came later, alongside the sync button, so the two controls could sit together without crowding the search bar.
 
 ### Watch out for:
 
 - **The web container needs write access to `data/material`.** See the updated `docker-compose.yml` in Phase 6, the `:ro` flag was removed from the web service's volume mount for exactly this reason. The database stays protected regardless, since `web/lib/db.ts` opens it with `readonly: true` at the code level, independent of what the filesystem itself allows.
-- **The upload route never touches the database.** It only writes a file. The watcher (Phase 1) and worker (Phase 2) pick it up exactly like any other manually dropped file, there's no special-cased "uploaded via web" path in the pipeline, which keeps the two systems decoupled.
-- **File size limits.** Next.js Route Handlers using `request.formData()` don't impose a low default body size limit the way Server Actions do, but very large scans can still be slow over a mobile connection. If uploads of multi-hundred-MB files are ever needed, that would be the point to add an explicit limit and a progress indicator, not necessary at the sizes typical for scanned study material.
+- **The upload route never touches the database.** It only writes a file (and, since Phase 11, an optional sidecar). The watcher (Phase 1) and worker (Phase 2) pick it up exactly like any other manually dropped file, there's no special-cased "uploaded via web" path in the pipeline, which keeps the two systems decoupled.
+- **File size limits.** Next.js Route Handlers using `request.formData()` don't impose a low default body size limit the way Server Actions do, but very large scans can still be slow over a mobile connection. The `XMLHttpRequest`-based progress bar (Phase 11) exists for exactly that reason, giving feedback during a slow upload, not because a hard size limit was hit. If uploads of multi-hundred-MB files are ever needed, that would still be the point to add an explicit limit.
 
 ---
 
@@ -1514,7 +1800,7 @@ Placed directly under the `<h1>`, see the full file in Phase 5 above (Phase 5 an
 
 **Goal:** A dark, minimalist visual style across both the overview page and the generated document pages, plus a clear visual indicator for documents that are still in the queue, and a corrected date (upload date, not the model's guessed content date).
 
-**Where:** 24/7 Server, `web/app/globals.css`, `web/public/static/document.css`, `web/app/layout.tsx`
+**Where:** App Server, `web/app/globals.css`, `web/public/static/document.css`, `web/app/layout.tsx`
 
 ### Color system
 
@@ -1532,6 +1818,8 @@ No gradients, no shadows, borders only where a surface needs to be visually sepa
 
 ```typescript
 import "./globals.css";
+import { ToastProvider } from "./_context/ToastContext";
+import Toast from "./components/Toast";
 
 export const metadata = {
     title: "Study Archive",
@@ -1544,18 +1832,30 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             <head>
                 <link rel="stylesheet" href="https://static.itsmarian.dev/fonts/font-awesome-v7.2.0/css/all.min.css" />
             </head>
-            <body>{children}</body>
+            <body>
+                <ToastProvider>
+                    <div className="page-shell">
+                        {children}
+                        <footer className="site-footer">
+                            <p>Study Archive by itsmarian</p>
+                            <p><a href="https://github.com/itsmarianmc/study-archive" target="_blank" rel="noopener noreferrer"><i className="fa-brands fa-github"></i> View on GitHub</a></p>
+                        </footer>
+                    </div>
+                    <Toast />
+                </ToastProvider>
+            </body>
         </html>
     );
 }
 ```
 
-Font Awesome is loaded once, globally, via CDN, since the clock icon used for in-progress documents (`fa-regular fa-clock`) and any future icons only need the free icon set, not the full pro kit or a local build step.
+Font Awesome is loaded once, globally, self-hosted from `static.itsmarian.dev` rather than a public CDN (see the note in Phase 4), so the clock icon used for in-progress documents (`fa-regular fa-clock`) and every other icon used across the site keep working even if the public internet or a third-party CDN is briefly unreachable, as long as `static.itsmarian.dev` itself stays up. `ToastProvider` (Phase 11) wraps everything so `useToast()` is available from any client component on any page, and `<Toast />` is mounted exactly once here rather than per-page, since it renders whichever single toast is currently active regardless of which page fired it. `page-shell` and `site-footer` (Phase 8's dark theme pass, styled in `globals.css` below) push the small "Study Archive by itsmarian" footer to the bottom of the viewport even on pages with little content, instead of it floating awkwardly right under a short list of documents.
 
 ### `web/app/globals.css`
 
 ```css
 :root,[data-theme=dark] {
+    --accent: #e4a10f;
     --bg: #0f0f10;
     --border: #ffffff14;
     --ease: cubic-bezier(.5, 0, 1, .5);
@@ -1576,6 +1876,54 @@ Font Awesome is loaded once, globally, via CDN, since the clock icon used for in
     transition: all 0.15s ease;
 }
 
+.toast {
+    -webkit-backdrop-filter: blur(24px);
+    backdrop-filter: blur(24px);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow);
+    opacity: 0;
+    pointer-events: none;
+    white-space: nowrap;
+    z-index: 10001;
+    background: #2c2c2e40;
+    border-radius: 50px;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 16px;
+    font-size: 14px;
+    font-weight: 500;
+    transition: all .15s cubic-bezier(.34,1.56,.64,1);
+    display: flex;
+    position: fixed;
+    top: 30px;
+    left: 50%;
+    transform: translate(-50%) translateY(-40px) scale(.9);
+    color: var(--text);
+}
+
+.toast.show {
+    opacity: 1;
+    transform: translate(-50%) translateY(0) scale(1);
+}
+
+.toast.toast-success {
+    color: #52b472;
+    background: #52b47340;
+    border: 1px solid #397d4f;
+}
+
+.toast.toast-error {
+    color: #fff;
+    background: #ff453a40;
+    border: 1px solid #ff453a;
+}
+
+.toast.toast-warning {
+    color: #fff;
+    background: #e4840f40;
+    border: 1px solid #e4840f;
+}
+
 body {
     margin: 0;
     font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -1583,11 +1931,49 @@ body {
     color: var(--text);
 }
 
+html, body {
+    height: 100%;
+}
+
+.page-shell {
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+}
+
+.page-shell > main {
+    flex: 1 0 auto;
+}
+
+.site-footer {
+    flex-shrink: 0;
+    padding: 20px;
+    text-align: center;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    border-top: 1px solid var(--surface2);
+}
+
+.site-footer p {
+    margin-block-start: 0.25rem;
+    margin-block-end: 0.25rem;
+}
+
+.site-footer a {
+    color: var(--text-muted);
+    text-decoration: none;
+}
+
+.site-footer a:hover {
+    text-decoration: underline;
+}
+
 main {
     max-width: 760px;
     margin: 0 auto;
-    padding: 40px 20px;
+    padding: 10px 20px 40px;
     transition: all 0.15s ease;
+    width: 100%;
 }
 
 h1 {
@@ -1655,25 +2041,47 @@ li.processing i {
     text-decoration: underline;
 }
 
-.header-elements {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    margin-bottom: 24px;
+.page-header {
+    max-width: 760px;
+    min-width: 400px;
+    margin: 0 auto;
+    padding: 40px 20px 0;
+    width: 100%;
 }
 
-.upload-link {
-    display: inline-block;
+.page-header-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 16px;
+}
+
+.page-header-top h1 {
+    margin: 0;
+}
+
+.page-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.icon-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 42px;
+    height: 42px;
     color: var(--text);
-    font-weight: 600;
     text-decoration: none;
     background: var(--surface);
     border: 1px solid var(--surface2);
     border-radius: 8px;
-    padding: 10px 16px;
+    font-size: 1.1rem;
+    cursor: pointer;
 }
 
-.upload-link:hover {
+.icon-button:hover {
     background: var(--surface2);
 }
 
@@ -1697,13 +2105,15 @@ form label {
 
 form select,
 form input[type="text"],
-form input[type="file"] {
+form input[type="file"],
+form textarea {
     font: inherit;
     color: var(--text);
     padding: 10px 12px;
     border: 1px solid var(--surface2);
     border-radius: 6px;
     background: var(--surface2);
+    resize: vertical;
 }
 
 form button {
@@ -1726,6 +2136,95 @@ form button:disabled {
     cursor: not-allowed;
 }
 
+.label-optional {
+    font-weight: 400;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+}
+
+.new-subject-field {
+    animation: field-in 0.2s ease;
+}
+
+@keyframes field-in {
+    from { opacity: 0; transform: translateY(-6px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.sr-only-input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}
+
+.dropzone {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    text-align: center;
+    padding: 32px 16px;
+    border: 2px dashed var(--surface2);
+    border-radius: 8px;
+    background: var(--surface2);
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.dropzone i {
+    font-size: 1.6rem;
+}
+
+.dropzone:hover {
+    border-color: var(--accent, #e4a10f);
+    color: var(--text);
+}
+
+.dropzone--active {
+    border-color: var(--accent, #e4a10f);
+    background: var(--surface3);
+    color: var(--text);
+}
+
+.dropzone--filled {
+    border-style: solid;
+    border-color: var(--surface3);
+    color: var(--text);
+}
+
+.dropzone-filename {
+    font-weight: 600;
+    word-break: break-all;
+}
+
+.dropzone-hint {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+}
+
+.upload-progress {
+    margin-top: 4px;
+    height: 6px;
+    border-radius: 999px;
+    background: var(--surface2);
+    overflow: hidden;
+}
+
+.upload-progress-bar {
+    height: 100%;
+    background: var(--accent, #e4a10f);
+    border-radius: 999px;
+    transition: width 0.15s ease;
+}
+
 .status {
     margin-top: 16px;
     padding: 12px 16px;
@@ -1743,15 +2242,32 @@ form button:disabled {
     color: #d97b7b;
 }
 
+.sync-button {
+    padding: 10px;
+    background: var(--surface);
+    border: 1px solid var(--surface2);
+    border-radius: 8px;
+    color: var(--text);
+    font-size: 1.1rem;
+    cursor: pointer;
+}
+
+.sync-button:hover:not(:disabled) {
+    background: var(--surface2);
+}
+
+.sync-button:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
 .search-form {
     flex-direction: row;
     padding: 0;
     background: none;
     border: none;
-    flex: 1;
-    border-left: 1px solid var(--surface2);
-    border-radius: 0px;
-    padding-left: 12px;
+    width: 100%;
+    margin-bottom: 24px;
 }
 
 .search-input {
@@ -1794,7 +2310,21 @@ form button:disabled {
     background: var(--surface);
     border: 1px solid var(--surface2);
     border-radius: 8px;
+}
+
+.folder-group-collapse {
+    display: grid;
+    grid-template-rows: 0fr;
+    transition: grid-template-rows 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.folder-group-collapse.open {
+    grid-template-rows: 1fr;
+}
+
+.folder-group-collapse-inner {
     overflow: hidden;
+    min-height: 0;
 }
 
 .folder-group-header {
@@ -1980,6 +2510,9 @@ form button:disabled {
 }
 ```
 
+> This is the final `globals.css`, including additions from later phases beyond the Phase 8 dark theme pass shown here: the `.toast` styles and `.page-shell`/`.site-footer` sticky-footer layout (Phase 11/Phase 8 layout revision), `.page-header`/`.page-header-actions`/`.icon-button`/`.sync-button` for the restructured header with the sync button (Phase 10), and `.dropzone`/`.upload-progress`/`.label-optional`/`.new-subject-field`/`.sr-only-input` for the drag-and-drop upload form (Phase 11). The core dark theme tokens (`--bg`, `--surface`, `--text`, etc.) and the original folder/document list styling described below are unchanged from Phase 8.
+
+
 **`li.processing`** is the visual state for documents still queued or being handled by the worker (Phase 2). The icon color (`#d9a441`, a muted amber) is the only non-neutral color on the page, deliberately, so an in-progress document stands out against the otherwise monochrome list without needing a badge or animation. The link inside it has no `href` and `cursor: default`, since there's no document page to open yet, only the filename and upload timestamp exist at that stage (see `ProcessingDocumentRow` in Phase 5).
 
 **Form inputs use `#2c2c2e`, one level lighter than the `#1c1c1e` card they sit in**, which is the "surface on surface" rule applied directly: the form itself is a surface on the page background, the inputs inside it are a surface on that surface.
@@ -2060,6 +2593,52 @@ section.summary {
     color: #c9c9ca;
 }
 
+section.notes {
+    background: var(--surface2);
+    border: 1px solid var(--surface3);
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin-bottom: 24px;
+}
+
+section.notes h2 {
+    font-size: 1rem;
+    margin: 0 0 10px;
+    color: var(--text2);
+}
+
+section.notes textarea {
+    width: 100%;
+    min-height: 90px;
+    resize: vertical;
+    background: var(--surface3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    font: inherit;
+    padding: 10px 12px;
+    box-sizing: border-box;
+    transition: border-color .15s var(--ease);
+}
+
+section.notes textarea:focus {
+    outline: none;
+    border-color: var(--text2);
+}
+
+section.notes .option-btn {
+    margin-top: 10px;
+    color: var(--text2);
+    font-family: DM Sans, sans-serif;
+    font-size: 14px;
+}
+
+.notes-status {
+    margin-left: 10px;
+    font-size: 0.85rem;
+    color: var(--text2);
+}
+
 section.content {
     background: var(--surface2);
     border: 1px solid var(--surface3);
@@ -2112,6 +2691,8 @@ section.content p {
 
 This is the stylesheet the generated document pages link to (`{{title}}`'s template in Phase 4, `<link rel="stylesheet" href="/static/document.css">`). The tag pills (`ul.tags li`) use `#2c2c2e`, the same "surface on surface" level as form inputs, since a tag sits visually inside the document card the same way an input sits inside a form.
 
+> `section.notes` and `.notes-status` (styling the Notes section and its inline `<script>`, both from Phase 11) are also already included here, they weren't part of the original Phase 8 dark theme pass, but this is the final file as it exists in the repo.
+
 ### The upload-date fix
 
 Two independent changes together fix the "wrong date shown" issue:
@@ -2133,7 +2714,7 @@ Two independent changes together fix the "wrong date shown" issue:
 
 **Goal:** Search results show *where* the match was found, not just that it matched. Documents are grouped by subject in collapsible sections instead of one flat list. Titles and subjects can be renamed, documents and whole subjects can be deleted, all from a "…" menu, without touching the filesystem or SQLite by hand.
 
-**Where:** 24/7 Server, `web/`
+**Where:** App Server, `web/`
 
 ### `web/lib/search.ts`
 
@@ -2217,7 +2798,7 @@ export default function OptionsMenu({ items }: { items: OptionsMenuItem[] }) {
             <button
                 type="button"
                 className="options-menu-trigger"
-                aria-label="Optionen"
+                aria-label="Options"
                 onClick={(e) => {
                     e.preventDefault();
                     e.stopPropagation();
@@ -2591,11 +3172,455 @@ Phase 5 deliberately opened the frontend's database connection as `{ readonly: t
 
 ---
 
+## Phase 10: Optional Notion Sync
+
+**Goal:** Mirror every document into a Notion database as a one-way sync, so the archive is linkable from wherever notes are already being taken, without turning Notion into a second source of truth.
+
+**Where:** App Server, `src/scripts/` (scheduled sync) and `web/app/api/sync/` (manual sync button)
+
+### Notion-side setup
+
+1. Create an internal integration at [notion.so/my-integrations](https://www.notion.so/my-integrations), copy its secret.
+2. Create a database with these properties, and share it with the integration (database → `•••` → Connections):
+
+| Property | Type | Purpose |
+|---|---|---|
+| Titel | Title | Document title (AI-generated, or the manual override from Phase 11) |
+| Typ | Select | Derived from file extension (PDF / Scan / Document) |
+| Subject | Select | The subject/folder the document lives in |
+| Tags | Multi-select | AI-generated tags |
+| URL | URL | Link back to the document's page on the website |
+| Processed | Checkbox | Whether the AI pipeline has finished this document yet |
+| Notes | Text | The manual notes field from Phase 11, independent of the AI content |
+| Archive ID | Text | The document's row ID, used to avoid duplicate pages on repeated syncs |
+| Last Synced | Date | Timestamp of the most recent successful sync |
+
+3. Copy the database ID out of its URL (the 32-character segment right before `?v=`).
+
+### `src/scripts/notion-sync.ts`
+
+```typescript
+import "dotenv/config";
+import { Client } from "@notionhq/client";
+import Database from "better-sqlite3";
+import path from "path";
+
+const NOTION_TOKEN = process.env.NOTION_TOKEN;
+const DATABASE_ID = process.env.NOTION_DATABASE_ID;
+const BASE_URL = process.env.STUDY_ARCHIVE_BASE_URL ?? "http://localhost:1920";
+
+if (!NOTION_TOKEN || !DATABASE_ID) {
+    console.error("NOTION_TOKEN and NOTION_DATABASE_ID must be set.");
+    process.exit(1);
+}
+
+const notion = new Client({ auth: NOTION_TOKEN });
+const DB_PATH = path.resolve(__dirname, "../../data/study-archive.db");
+const db = new Database(DB_PATH, { readonly: true });
+
+interface DocRow {
+    id: number;
+    folder: string;
+    filename: string;
+    title: string | null;
+    tags: string | null;
+    status: string;
+    notes: string | null;
+}
+
+function getDocType(filename: string): string {
+    const ext = filename.split(".").pop()?.toLowerCase() ?? "";
+    if (ext === "pdf") return "PDF";
+    if (["jpg", "jpeg", "png", "heic"].includes(ext)) return "Scan";
+    return "Document";
+}
+
+async function findExistingPage(archiveId: string) {
+    const res = await notion.databases.query({
+        database_id: DATABASE_ID!,
+        filter: { property: "Archive ID", rich_text: { equals: archiveId } },
+    });
+    return res.results[0] ?? null;
+}
+
+async function syncDocument(doc: DocRow) {
+    const archiveId = String(doc.id);
+    const isProcessed = doc.status === "done";
+    const tags: string[] = isProcessed && doc.tags ? JSON.parse(doc.tags) : [];
+    const url = `${BASE_URL}/${doc.folder}/${doc.id}`;
+    // While a document is still queued: filename as a placeholder title.
+    // Once processed: the real, AI-generated (or manually overridden) title.
+    const title = isProcessed ? (doc.title?.trim() || doc.filename) : doc.filename;
+
+    const properties = {
+        Titel: { title: [{ text: { content: title } }] },
+        Typ: { select: { name: getDocType(doc.filename) } },
+        Subject: { select: { name: doc.folder } },
+        Tags: { multi_select: tags.map((t) => ({ name: t })) },
+        URL: { url },
+        Processed: { checkbox: isProcessed },
+        Notes: { rich_text: doc.notes ? [{ text: { content: doc.notes.slice(0, 2000) } }] : [] },
+        "Archive ID": { rich_text: [{ text: { content: archiveId } }] },
+        "Last Synced": { date: { start: new Date().toISOString() } },
+    };
+
+    const existing = await findExistingPage(archiveId);
+    if (existing) {
+        await notion.pages.update({ page_id: existing.id, properties });
+    } else {
+        await notion.pages.create({ parent: { database_id: DATABASE_ID! }, properties });
+    }
+}
+
+async function main() {
+    // Every document syncs regardless of status, so a freshly uploaded file
+    // shows up immediately (Processed unchecked) instead of only once it's done.
+    const docs = db.prepare(`SELECT id, folder, filename, title, tags, status, notes FROM documents`).all() as DocRow[];
+    for (const doc of docs) {
+        try {
+            await syncDocument(doc);
+        } catch (err) {
+            console.error(`Sync failed for ${doc.filename}:`, err);
+        }
+    }
+}
+
+main();
+```
+
+### Two ways to run it
+
+**On a schedule**, so the archive stays in sync without anyone remembering to trigger it. A systemd timer works well here (see `deploy/` in the repo for ready-to-use unit files), running every 30 minutes is plenty since Notion isn't needed in real time:
+
+```bash
+npm run sync:notion
+```
+
+**On demand**, via a sync button in the dashboard header. This calls a matching API route (`web/app/api/sync/route.ts`) that runs the exact same logic directly inside the web container, so a manual sync doesn't need shell access to the server at all.
+
+### `web/app/api/sync/route.ts`
+
+```typescript
+import { NextResponse } from "next/server";
+import { Client } from "@notionhq/client";
+import { getAllDocuments } from "@/lib/db";
+
+const NOTION_TOKEN = process.env.NOTION_TOKEN;
+const DATABASE_ID = process.env.NOTION_DATABASE_ID;
+const BASE_URL = process.env.STUDY_ARCHIVE_BASE_URL ?? "http://localhost:1920";
+
+function getDocType(filename: string): string {
+    const ext = filename.split(".").pop()?.toLowerCase() ?? "";
+    if (ext === "pdf") return "PDF";
+    if (["jpg", "jpeg", "png", "heic"].includes(ext)) return "Scan";
+    return "Dokument";
+}
+
+async function findExistingPage(notion: Client, archiveId: string) {
+    const res = await notion.databases.query({
+        database_id: DATABASE_ID!,
+        filter: {
+            property: "Archive ID",
+            rich_text: { equals: archiveId },
+        },
+    });
+    return res.results[0] ?? null;
+}
+
+export async function POST() {
+    if (!NOTION_TOKEN || !DATABASE_ID) {
+        return NextResponse.json(
+            { error: "NOTION_TOKEN oder NOTION_DATABASE_ID fehlt in der Umgebung." },
+            { status: 500 }
+        );
+    }
+
+    const notion = new Client({ auth: NOTION_TOKEN });
+    const docs = getAllDocuments();
+
+    let created = 0;
+    let updated = 0;
+    const errors: string[] = [];
+
+    for (const doc of docs) {
+        try {
+            const archiveId = String(doc.id);
+            const isProcessed = doc.status === "done";
+            const tags: string[] = isProcessed && doc.tags ? JSON.parse(doc.tags) : [];
+            const url = `${BASE_URL}/${doc.folder}/${doc.id}`;
+            // Solange nicht fertig verarbeitet: Dateiname als Platzhalter-Titel.
+            // Nach Verarbeitung: echter, von Ollama generierter Titel + Tags.
+            const title = isProcessed ? (doc.title?.trim() || doc.filename) : doc.filename;
+
+            const properties = {
+                Titel: { title: [{ text: { content: title } }] },
+                Typ: { select: { name: getDocType(doc.filename) } },
+                Subject: { select: { name: doc.folder } },
+                Tags: { multi_select: tags.map((t) => ({ name: t })) },
+                URL: { url },
+                Processed: { checkbox: isProcessed },
+                Notes: { rich_text: doc.notes ? [{ text: { content: doc.notes.slice(0, 2000) } }] : [] },
+                "Archive ID": { rich_text: [{ text: { content: archiveId } }] },
+                "Last Synced": { date: { start: new Date().toISOString() } },
+            };
+
+            const existing = await findExistingPage(notion, archiveId);
+
+            if (existing) {
+                await notion.pages.update({ page_id: existing.id, properties });
+                updated++;
+            } else {
+                await notion.pages.create({ parent: { database_id: DATABASE_ID }, properties });
+                created++;
+            }
+        } catch (err) {
+            errors.push(`${doc.filename}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }
+
+    return NextResponse.json({
+        total: docs.length,
+        created,
+        updated,
+        errors,
+    });
+}
+```
+
+This is a near-duplicate of `syncDocument`/`buildProperties` from `notion-sync.ts`, deliberately, rather than importing the script from the API route. Route handlers run inside the Next.js server runtime; `notion-sync.ts` is meant to run standalone under `tsx` or as a systemd timer, sharing code between the two would mean either bundling the script's dependencies into the web build or adding an internal HTTP hop for no real benefit at this scale. The response reports `created`/`updated`/`errors` counts (rather than exiting the process on failure like the script does), since `SyncButton` needs something to show the person as a toast.
+
+### `web/app/components/SyncButton.tsx`
+
+```typescript
+"use client";
+
+import { useState } from "react";
+import { useRouter } from "next/navigation";
+import { useToast } from "../_context/ToastContext";
+
+export default function SyncButton() {
+    const [loading, setLoading] = useState(false);
+    const { showToast } = useToast();
+    const router = useRouter();
+
+    async function handleSync() {
+        setLoading(true);
+        try {
+            const res = await fetch("/api/sync", { method: "POST" });
+            const data = await res.json();
+            if (!res.ok) {
+                showToast(data.error ?? "Sync failed", "toast-error");
+            } else {
+                const parts = [`${data.created} new`, `${data.updated} updated`];
+                if (data.errors.length) parts.push(`${data.errors.length} error(s)`);
+                showToast(parts.join(", "), data.errors.length ? "toast-warning" : "toast-success");
+                router.refresh();
+            }
+        } catch {
+            showToast("Sync failed", "toast-error");
+        } finally {
+            setLoading(false);
+        }
+    }
+
+    return (
+        <button
+            type="button"
+            className="sync-button"
+            onClick={handleSync}
+            disabled={loading}
+            aria-label="Sync with Notion"
+            title="Sync with Notion"
+        >
+            <i className={`fas fa-sync-alt${loading ? " fa-spin" : ""}`}></i>
+        </button>
+    );
+}
+```
+
+A spinning sync icon while `loading`, a toast with the created/updated/error counts on completion (see Phase 11 for the toast system itself), and `router.refresh()` so the page's server-rendered data picks up anything Notion-side that could plausibly have looped back (it doesn't, this is one-way, but refreshing is cheap and keeps the UI honest about "sync just ran").
+
+### Watch out for:
+
+- **Dedup relies entirely on the "Archive ID" property.** If it's ever deleted or renamed in Notion, every subsequent sync will create duplicate pages instead of updating existing ones.
+- **Select vs. Multi-select matters.** `Subject` and `Typ` must be created as **Select**, not **Multi-select** - Notion's API rejects a `select` payload against a `multi_select` property (and vice versa) with a fairly opaque error message.
+- **Rich text has a length limit.** Notes longer than 2000 characters are truncated before syncing; Notion's rich_text blocks have their own limits per API call.
+- **The API route and the script duplicate `buildProperties`/`getDocType` logic.** A change to the Notion property mapping (a renamed column, a new field) needs to be applied in both `src/scripts/notion-sync.ts` and `web/app/api/sync/route.ts`, they will silently drift apart otherwise.
+
+---
+
+## Phase 11: Manual Overrides, Notes, and Upload UX
+
+**Goal:** Let a person correct or add to what the AI generates, independently of it, and make the upload flow itself feel less like a bare HTML form.
+
+**Where:** App Server, spanning `src/db/`, `src/watcher/`, `web/app/upload/`, `web/app/components/`
+
+### Optional title/summary overrides and a separate Notes field
+
+Three new columns on `documents`: `user_title`, `user_summary`, `notes`. The first two override the AI-generated title/summary once processing finishes; `notes` is never touched by the AI pipeline at all, purely a place for the person's own remarks.
+
+Since a document's database row doesn't exist yet at the moment of upload (the watcher creates it), any overrides typed into the upload form are written to a small **sidecar file** next to the uploaded document - `.filename.meta.json`, hidden so the watcher's own ignore pattern (`/(^|[/\\])\./`) skips it as a source file. The watcher reads it, if present, the moment it detects the real file, folds the values into the same `enqueueFile()` call, and deletes the sidecar (see the full updated `src/watcher/index.ts` in Phase 1, this is the same code, shown here again for context):
+
+```typescript
+// inside the watcher's "add" handler
+const metaPath = sidecarPath(filePath); // .${filename}.meta.json, next to the real file
+if (fs.existsSync(metaPath)) {
+    try {
+        const meta = JSON.parse(fs.readFileSync(metaPath, "utf-8"));
+        userTitle = typeof meta.title === "string" ? meta.title : undefined;
+        userSummary = typeof meta.summary === "string" ? meta.summary : undefined;
+        notes = typeof meta.notes === "string" ? meta.notes : undefined;
+    } catch (err) {
+        console.error(`[watcher] failed to read sidecar meta for ${filename}:`, err);
+    } finally {
+        fs.unlinkSync(metaPath); // always remove it, even if it failed to parse
+    }
+}
+```
+
+The `try/catch/finally` matters here specifically: a half-written or malformed sidecar (e.g. the upload route crashed after creating it but before finishing the JSON) should never permanently block the real file from being enqueued, and it should never leave the sidecar sitting around to be picked up again on a future watcher restart. `enqueueFile()`'s signature also grows to accept the optional `userTitle`/`userSummary`/`notes` fields shown here (see Phase 2's updated `src/db/queue.ts`).
+
+`markDone()` then prefers the override over the AI value if one was provided:
+
+```sql
+title = COALESCE(NULLIF(user_title, ''), @title),
+summary = COALESCE(NULLIF(user_summary, ''), @summary)
+```
+
+Notes are independent of processing entirely and editable any time, both from the upload form and later directly on a document's own page (a small fetch-based textarea, since the generated page is static HTML rather than a live React component).
+
+### Subject dropdown: creating a new subject inline
+
+Rather than a separate always-visible "new subject" text field, the dropdown itself gets a `+ Create New Subject...` option using a sentinel value that can never collide with a real, sanitized folder name:
+
+```typescript
+const CREATE_NEW_SENTINEL = "__create_new_subject__";
+```
+
+Selecting it reveals a second input for the new name; selecting an existing subject hides that input again. Existing subjects are shown capitalized in the dropdown for readability, the underlying folder name on disk stays lowercase and unchanged.
+
+### Drag-and-drop upload with progress
+
+The native `<input type="file">` is visually hidden (not `display: none`, which breaks keyboard accessibility, but the usual screen-reader-only clipping technique) and replaced with a dashed-border dropzone that accepts both click-to-browse and drag-and-drop.
+
+Upload progress needs `XMLHttpRequest` rather than `fetch`, since `fetch` doesn't expose upload progress events:
+
+```typescript
+const xhr = new XMLHttpRequest();
+xhr.open("POST", "/api/upload");
+xhr.upload.addEventListener("progress", (event) => {
+    if (event.lengthComputable) {
+        setProgress(Math.round((event.loaded / event.total) * 100));
+    }
+});
+xhr.send(formData);
+```
+
+### A shared toast system
+
+Success/error feedback (upload results, sync results) shows as a small toast notification instead of inline status text that pushes layout around. A simple React Context (`ToastContext`) holds a queue of pending toasts; a single `<Toast />` component, mounted once in the root layout, renders whichever one is currently active.
+
+### `web/app/_context/ToastContext.tsx`
+
+```typescript
+"use client";
+
+import { createContext, useCallback, useContext, useState, ReactNode } from "react";
+
+export interface ToastItem {
+    msg: string;
+    cls?: "toast-success" | "toast-error" | "toast-warning";
+    duration?: number;
+}
+
+interface ToastContextValue {
+    toastQueue: ToastItem[];
+    showToast: (msg: string, cls?: ToastItem["cls"], duration?: number) => void;
+    consumeToast: () => void;
+}
+
+const ToastContext = createContext<ToastContextValue | null>(null);
+
+export function ToastProvider({ children }: { children: ReactNode }) {
+    const [toastQueue, setToastQueue] = useState<ToastItem[]>([]);
+
+    const showToast = useCallback((msg: string, cls?: ToastItem["cls"], duration?: number) => {
+        setToastQueue((q) => [...q, { msg, cls, duration }]);
+    }, []);
+
+    const consumeToast = useCallback(() => {
+        setToastQueue((q) => q.slice(1));
+    }, []);
+
+    return (
+        <ToastContext.Provider value={{ toastQueue, showToast, consumeToast }}>
+            {children}
+        </ToastContext.Provider>
+    );
+}
+
+export function useToast() {
+    const ctx = useContext(ToastContext);
+    if (!ctx) throw new Error("useToast must be used within a ToastProvider");
+    return ctx;
+}
+```
+
+### `web/app/components/Toast.tsx`
+
+```typescript
+"use client";
+
+import { useEffect, useState } from "react";
+import { useToast } from "../_context/ToastContext";
+
+export default function Toast() {
+    const { toastQueue, consumeToast } = useToast();
+    const [visible, setVisible] = useState(false);
+    const [current, setCurrent] = useState<{ msg: string; cls?: string } | null>(null);
+
+    useEffect(() => {
+        if (toastQueue.length === 0) return;
+        const item = toastQueue[0];
+        setCurrent({ msg: item.msg, cls: item.cls });
+        setVisible(true);
+        const t = setTimeout(() => {
+            setVisible(false);
+            setTimeout(() => {
+                setCurrent(null);
+                consumeToast();
+            }, 300);
+        }, item.duration || 2500);
+        return () => clearTimeout(t);
+    }, [toastQueue, consumeToast]);
+
+    if (!current) return (
+        <div id="toast" className="toast" style={{ display: "none", visibility: "hidden" }} />
+    );
+
+    return (
+        <div id="toast" className={`toast${visible ? " show" : ""}${current.cls ? " " + current.cls : ""}`}>
+            {current.msg}
+        </div>
+    );
+}
+```
+
+`showToast()` only ever appends to the queue, it's `<Toast />`'s own `useEffect` that pulls the front item, shows it, waits `duration` (2.5s default), fades it out, then calls `consumeToast()` to advance to the next one, so toasts fired in quick succession (e.g. several validation errors) queue up and play one at a time instead of overlapping or replacing each other. `<Toast />` is mounted once in `layout.tsx` (below), and any client component wraps its own logic in `useToast()` to fire one, `SyncButton` and the upload form (Phase 11) both do this instead of managing their own local status text.
+
+### Watch out for:
+
+- **The sidecar file must be written *after* the real file finishes uploading**, and its filename must exactly match (including any `-<timestamp>` suffix appended on a name collision), otherwise the watcher never finds it and the overrides are silently lost.
+- **The sentinel value must stay outside the range `sanitizeFolderName()` can ever produce.** Since that function only ever outputs lowercase `a-z0-9-` strings, a value containing underscores and a double-leading-underscore is guaranteed safe, but changing the sanitizer later without re-checking this assumption could theoretically create a collision.
+- **`XMLHttpRequest` progress events fire based on bytes sent, not bytes processed.** A 100% progress bar means the upload finished, not that OCR/processing has, that distinction is what the "still processing" indicator (Phase 8) is for.
+
+---
+
 ## Build Order
 
 1. Get the watcher running, first just logging to the console instead of the database (Phase 1)
 2. Create the SQLite schema, connect the watcher to the queue (Phase 2)
-3. Set up `ollama-main-pc/` on the GPU machine, make Ollama reachable on the LAN, verify with `curl` from the 24/7 Server (Phase 3, networking part)
+3. Set up `ollama-host/` on the GPU machine, make Ollama reachable on the LAN, verify with `curl` from the App Server (Phase 3, networking part)
 4. Run real handwriting test pages through `qwen3.5:9b-q8_0`, evaluate the error rate (Phase 3, model test)
 5. Build the worker loop with retry logic, run one test file through the full pipeline end to end (Phases 2+3 combined)
 6. Build the HTML template and generator (Phase 4)
@@ -2608,4 +3633,5 @@ Phase 5 deliberately opened the frontend's database connection as `{ readonly: t
 13. Keep `src/scripts/regenerate-html.ts` handy for any future template or styling change, so existing documents don't need reprocessing through Ollama to pick it up (Phase 4 addendum)
 14. Detect PDFs with an unusable text layer (broken font embedding) and fall back to rasterizing the page + vision OCR instead of silently saving garbage (Phase 4 addendum)
 15. Group documents by subject into collapsible sections, highlight the matched snippet in search results, and add rename/delete for both documents and whole subjects via a "…" menu (Phase 9)
-
+16. Set up a Notion database and internal integration, add the sync script and a matching API route/button for on-demand syncing (Phase 10)
+17. Add optional title/summary overrides and a manual Notes field via a sidecar file mechanism, an inline "create new subject" flow, a drag-and-drop dropzone with real upload progress, and a shared toast notification system (Phase 11)
