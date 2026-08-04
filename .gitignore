@@ -1,0 +1,13 @@
+# AI
+.claude
+
+# DEV
+node_modules/
+.next/
+.env.local
+.env
+
+web/node_modules/
+web/.next/
+web/.env.local
+web/.env

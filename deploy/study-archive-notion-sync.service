@@ -1,0 +1,15 @@
+[Unit]
+Description=Study Archive -> Notion Sync (one-shot)
+After=network-online.target
+Wants=network-online.target
+OnFailure=study-archive-notion-sync-notify.service
+
+[Service]
+Type=oneshot
+User=marian
+WorkingDirectory=/home/marian/study-archive
+EnvironmentFile=/home/marian/study-archive/.env
+ExecStart=/usr/bin/npx tsx src/scripts/notion-sync.ts
+
+[Install]
+WantedBy=multi-user.target

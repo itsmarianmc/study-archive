@@ -1,0 +1,13 @@
+[Unit]
+Description=Study Archive -> Notion Sync - Fehler-Benachrichtigung
+
+[Service]
+Type=oneshot
+EnvironmentFile=/home/marian/study-archive/.env
+ExecStart=/bin/sh -c '\
+    if [ -z "$SYNC_FAILURE_WEBHOOK_URL" ]; then \
+        echo "SYNC_FAILURE_WEBHOOK_URL nicht gesetzt, überspringe Benachrichtigung."; \
+        exit 0; \
+    fi; \
+    curl -fsS --max-time 10 "$SYNC_FAILURE_WEBHOOK_URL" \
+'

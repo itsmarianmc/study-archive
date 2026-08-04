@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{title}} - Study Archive</title>
+    <link rel="stylesheet" href="https://static.itsmarian.dev/fonts/font-awesome-v7.2.0/css/all.min.css">
+    <link rel="stylesheet" href="/static/document.css">
+    <meta name="description" content="Local-first study material archive">
+</head>
+<body>
+    <article>
+        <header>
+            <h1>{{title}}</h1>
+            <div class="meta">
+                <span class="folder">{{folder}}</span>
+                <time datetime="{{uploadDate}}">{{uploadDateFormatted}}</time>
+                {{confidenceBadgeHtml}}
+            </div>
+            <ul class="tags">{{tagsHtml}}</ul>
+        </header>
+        
+        <section class="summary">
+            <p>{{summary}}</p>
+        </section>
+        <section class="notes">
+            <h2>Notes</h2>
+            <textarea id="notes-input" placeholder="Your own notes for this document (not AI-generated)…"></textarea>
+            <button id="notes-save-btn" class="option-btn" type="button">Save notes</button>
+            <span id="notes-status" class="notes-status"></span>
+        </section>
+        <section class="content">
+            {{contentHtml}}
+        </section>
+        <section class="flashcards" id="flashcards-section">
+            <div class="flashcards-header">
+                <h2>Flashcards</h2>
+                <div class="flashcards-header-actions">
+                    <button class="option-btn" id="flashcards-generate-btn" type="button">
+                        <i class="fa-solid fa-wand-magic-sparkles"></i> Generate with AI
+                    </button>
+                    <a class="option-btn flashcards-review-link" id="flashcards-review-link" href="/review?folder={{folder}}">
+                        <i class="fa-solid fa-layer-group"></i> Review this subject
+                    </a>
+                </div>
+            </div>
+
+            <div class="flashcards-group" id="flashcards-pending-group" hidden>
+                <h3><i class="fa-solid fa-wand-magic-sparkles"></i> Suggested by AI &mdash; review before adding</h3>
+                <ul class="flashcard-list" id="flashcards-pending-list"></ul>
+            </div>
+
+            <div class="flashcards-group">
+                <h3>Your Flashcards</h3>
+                <ul class="flashcard-list" id="flashcards-active-list"></ul>
+                <p class="flashcards-empty" id="flashcards-empty" hidden>No flashcards yet for this document.</p>
+            </div>
+
+            <form class="flashcard-add-form" id="flashcard-add-form">
+                <input type="text" id="flashcard-add-question" placeholder="New question" required>
+                <input type="text" id="flashcard-add-answer" placeholder="New answer" required>
+                <button type="submit" class="option-btn">Add flashcard</button>
+            </form>
+        </section>
+
+        <section class="related" id="related-section" hidden>
+            <h2>Related Documents</h2>
+            <ul id="related-list"></ul>
+        </section>
+        <footer>
+            <button class="option-btn">
+                <a href="/"><i class="fa-solid fa-arrow-left"></i> Back To Overview</a>
+            </button>
+            <button class="option-btn">
+                <a href="/api/documents/{{id}}/download" download><i class="fa-solid fa-download"></i> Download Original File</a>
+            </button>
+            <div class="footer-notification">
+                <p class="ai-disclaimer">
+                    NOTE: The content in this file was generated using Artificial Intelligence
+                    and may contain inaccuracies, including but not limited to those
+                    especially for handwritten source material.
+                    Always verify against the original document before relying on this content.
+                    No liability is assumed for any errors or omissions in the content of this file.
+                </p>
+            </div>
+        </footer>
+    </article>
+    <script>
+        (function () {
+            const docId = "{{id}}";
+            const textarea = document.getElementById("notes-input");
+            const saveBtn = document.getElementById("notes-save-btn");
+            const status = document.getElementById("notes-status");
+
+            fetch(`/api/documents/${docId}`)
+                .then((res) => res.json())
+                .then((data) => { textarea.value = data.notes || ""; })
+                .catch(() => { status.textContent = "Could not load notes."; });
+
+            const relatedSection = document.getElementById("related-section");
+            const relatedList = document.getElementById("related-list");
+
+            function escapeForHtml(str) {
+                const div = document.createElement("div");
+                div.textContent = str;
+                return div.innerHTML;
+            }
+
+            fetch(`/api/documents/${docId}/related`)
+                .then((res) => res.json())
+                .then((data) => {
+                    const items = data.related || [];
+                    if (!items.length) return;
+
+                    relatedList.innerHTML = items
+                        .map((item) => {
+                            const url = `/${encodeURIComponent(item.folder)}/${item.id}`;
+                            return `<li><a href="${url}">${escapeForHtml(item.title)}</a><span class="related-folder">${escapeForHtml(item.folder)}</span></li>`;
+                        })
+                        .join("");
+                    relatedSection.hidden = false;
+                })
+                .catch(() => {});
+
+            saveBtn.addEventListener("click", () => {
+                status.textContent = "Saving…";
+                fetch(`/api/documents/${docId}`, {
+                    method: "PATCH",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ notes: textarea.value }),
+                })
+                    .then((res) => {
+                        if (!res.ok) throw new Error();
+                        status.textContent = "Saved.";
+                        setTimeout(() => { status.textContent = ""; }, 2000);
+                    })
+                    .catch(() => { status.textContent = "Save failed."; });
+            });
+
+            const pendingGroup = document.getElementById("flashcards-pending-group");
+            const pendingList = document.getElementById("flashcards-pending-list");
+            const activeList = document.getElementById("flashcards-active-list");
+            const emptyNotice = document.getElementById("flashcards-empty");
+            const addForm = document.getElementById("flashcard-add-form");
+            const addQuestionInput = document.getElementById("flashcard-add-question");
+            const addAnswerInput = document.getElementById("flashcard-add-answer");
+            const generateBtn = document.getElementById("flashcards-generate-btn");
+
+            function flashcardsUrl(suffix) {
+                return `/api/documents/${docId}/flashcards${suffix || ""}`;
+            }
+
+            function renderPendingCard(card) {
+                const li = document.createElement("li");
+                li.className = "flashcard-item flashcard-item--pending";
+                li.innerHTML = `
+                    <div class="flashcard-fields">
+                        <input type="text" class="flashcard-input flashcard-question-input" value="${escapeForHtml(card.question)}">
+                        <input type="text" class="flashcard-input flashcard-answer-input" value="${escapeForHtml(card.answer)}">
+                    </div>
+                    <div class="flashcard-actions">
+                        <button type="button" class="flashcard-btn flashcard-btn--accept"><i class="fa-solid fa-check"></i> Add</button>
+                        <button type="button" class="flashcard-btn flashcard-btn--discard"><i class="fa-solid fa-xmark"></i> Discard</button>
+                    </div>`;
+
+                const questionInput = li.querySelector(".flashcard-question-input");
+                const answerInput = li.querySelector(".flashcard-answer-input");
+
+                li.querySelector(".flashcard-btn--accept").addEventListener("click", () => {
+                    fetch(flashcardsUrl(`/${card.id}`), {
+                        method: "PATCH",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ action: "accept", question: questionInput.value, answer: answerInput.value }),
+                    }).then(() => loadFlashcards());
+                });
+                li.querySelector(".flashcard-btn--discard").addEventListener("click", () => {
+                    if (!window.confirm("Discard this suggested flashcard?")) return;
+                    fetch(flashcardsUrl(`/${card.id}`), { method: "DELETE" }).then(() => loadFlashcards());
+                });
+
+                return li;
+            }
+
+            function renderActiveCard(card) {
+                const li = document.createElement("li");
+                li.className = "flashcard-item";
+                li.innerHTML = `
+                    <div class="flashcard-fields">
+                        <input type="text" class="flashcard-input flashcard-question-input" value="${escapeForHtml(card.question)}">
+                        <input type="text" class="flashcard-input flashcard-answer-input" value="${escapeForHtml(card.answer)}">
+                    </div>
+                    <div class="flashcard-actions">
+                        <span class="flashcard-box-badge" title="Leitner box">Box ${card.box}</span>
+                        <button type="button" class="flashcard-btn flashcard-btn--save"><i class="fa-solid fa-floppy-disk"></i> Save</button>
+                        <button type="button" class="flashcard-btn flashcard-btn--discard"><i class="fa-solid fa-trash"></i> Delete</button>
+                    </div>`;
+
+                const questionInput = li.querySelector(".flashcard-question-input");
+                const answerInput = li.querySelector(".flashcard-answer-input");
+
+                li.querySelector(".flashcard-btn--save").addEventListener("click", () => {
+                    fetch(flashcardsUrl(`/${card.id}`), {
+                        method: "PATCH",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ question: questionInput.value, answer: answerInput.value }),
+                    });
+                });
+                li.querySelector(".flashcard-btn--discard").addEventListener("click", () => {
+                    if (!window.confirm("Delete this flashcard?")) return;
+                    fetch(flashcardsUrl(`/${card.id}`), { method: "DELETE" }).then(() => loadFlashcards());
+                });
+
+                return li;
+            }
+
+            function loadFlashcards() {
+                fetch(flashcardsUrl())
+                    .then((res) => res.json())
+                    .then((data) => {
+                        const pending = data.pending || [];
+                        const active = data.active || [];
+
+                        pendingList.innerHTML = "";
+                        pending.forEach((card) => pendingList.appendChild(renderPendingCard(card)));
+                        pendingGroup.hidden = pending.length === 0;
+
+                        activeList.innerHTML = "";
+                        active.forEach((card) => activeList.appendChild(renderActiveCard(card)));
+                        emptyNotice.hidden = active.length !== 0;
+                    })
+                    .catch(() => {});
+            }
+
+            generateBtn.addEventListener("click", () => {
+                generateBtn.disabled = true;
+                generateBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Generating…';
+
+                fetch(flashcardsUrl("/generate"), { method: "POST" })
+                    .then((res) => res.json().then((data) => ({ ok: res.ok, data })))
+                    .then(({ ok, data }) => {
+                        if (!ok) throw new Error(data?.error || "AI flashcard generation failed.");
+                        loadFlashcards();
+                    })
+                    .catch((err) => {
+                        window.alert(err instanceof Error ? err.message : "AI flashcard generation failed.");
+                    })
+                    .finally(() => {
+                        generateBtn.disabled = false;
+                        generateBtn.innerHTML = '<i class="fa-solid fa-wand-magic-sparkles"></i> Generate with AI';
+                    });
+            });
+
+            addForm.addEventListener("submit", (e) => {
+                e.preventDefault();
+                const question = addQuestionInput.value.trim();
+                const answer = addAnswerInput.value.trim();
+                if (!question || !answer) return;
+
+                fetch(flashcardsUrl(), {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ question, answer }),
+                }).then((res) => {
+                    if (!res.ok) return;
+                    addQuestionInput.value = "";
+                    addAnswerInput.value = "";
+                    loadFlashcards();
+                });
+            });
+
+            loadFlashcards();
+        })();
+    </script>
+</body>
+</html>

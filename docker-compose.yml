@@ -1,0 +1,27 @@
+services:
+    study-archive-pipeline:
+        image: study-archive-pipeline:latest
+        container_name: study-archive-pipeline
+        restart: unless-stopped
+        environment:
+            - OLLAMA_URL=http://localhost:11434
+            - NOTION_TOKEN=${NOTION_TOKEN}
+            - NOTION_DATABASE_ID=${NOTION_DATABASE_ID}
+            - STUDY_ARCHIVE_BASE_URL=${STUDY_ARCHIVE_BASE_URL}
+        volumes:
+            - /home/marian/docker/study-archive/data:/app/data
+
+    study-archive-web:
+        image: study-archive-web:latest
+        container_name: study-archive-web
+        restart: unless-stopped
+        ports:
+            - "1920:3000"
+        environment:
+            - NOTION_TOKEN=${NOTION_TOKEN}
+            - NOTION_DATABASE_ID=${NOTION_DATABASE_ID}
+            - STUDY_ARCHIVE_BASE_URL=${STUDY_ARCHIVE_BASE_URL}
+        volumes:
+            - /home/marian/docker/study-archive/data:/app/data
+        depends_on:
+            - study-archive-pipeline
